@@ -23,7 +23,7 @@ class _Parser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     theatre = argparse.ArgumentParser(add_help=False)
-    theatre.add_argument("--theatre", default=argparse.SUPPRESS, help="theatre directory (default: .)")
+    theatre.add_argument("--theatre", default=argparse.SUPPRESS, help="theatre directory (default: $TROUPE_THEATRE or .)")
     p = _Parser(prog="troupe")
     sub = p.add_subparsers(dest="command", required=True, parser_class=_Parser)
     config = sub.add_parser("config", parents=[theatre], help="inspect and change configuration")
@@ -96,7 +96,9 @@ def out(text: str) -> None:
 def run(args: argparse.Namespace) -> int:
     from .store import Troupe
 
-    theatre = getattr(args, "theatre", ".")
+    theatre = getattr(args, "theatre", None)
+    if theatre is None:
+        theatre = os.environ.get("TROUPE_THEATRE") or "."
     path_segs = parse_path(args.path) if getattr(args, "path", None) is not None else None
     value = parse_value(args.value) if args.action == "set" else None
     cfg = config_file(theatre)

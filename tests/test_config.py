@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -134,3 +135,13 @@ def test_history(theatre):
 
 def test_missing_config(tmp_path):
     assert troupe(tmp_path, "show", "x").returncode == 4
+
+
+def test_theatre_env_default(theatre, tmp_path_factory):
+    run = lambda env, *extra: subprocess.run(
+        [sys.executable, "-m", "troupe.cli_main", "config", "show", "name", *extra],
+        capture_output=True, cwd=tmp_path_factory.mktemp("cwd"), env={**os.environ, **env},
+    )
+    assert run({"TROUPE_THEATRE": str(theatre)}).stdout == b"demo\n"
+    assert run({"TROUPE_THEATRE": ""}).returncode == 4
+    assert run({"TROUPE_THEATRE": "/nonexistent"}, "--theatre", str(theatre)).stdout == b"demo\n"
