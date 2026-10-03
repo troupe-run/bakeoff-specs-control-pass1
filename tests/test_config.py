@@ -69,15 +69,46 @@ def set_ok(theatre, path, value):
         ("flow.y.1", b"2\n"),
     ],
 )
-def test_show(theatre, path, out):
-    r = troupe(theatre, "show", path)
-    assert (r.returncode, r.stdout) == (0, out)
+def test_get(theatre, path, out):
+    for action in ("get", "show"):
+        r = troupe(theatre, action, path)
+        assert (r.returncode, r.stdout) == (0, out)
 
 
 @pytest.mark.parametrize("path,code", [("agents", 5), ("tags", 5), ("nope", 5), ("name.x", 5)])
-def test_show_errors(theatre, path, code):
-    r = troupe(theatre, "show", path)
+def test_get_errors(theatre, path, code):
+    r = troupe(theatre, "get", path)
     assert r.returncode == code and r.stdout == b"" and path.encode() in r.stderr
+    assert (b"config show" in r.stderr) == (path in ("agents", "tags"))
+    if path.startswith("n"):
+        assert troupe(theatre, "show", path).returncode == code
+
+
+def test_show_sections(theatre):
+    from ruamel.yaml import YAML
+    r = troupe(theatre, "show", "agents")
+    assert r.returncode == 0
+    assert r.stdout.decode() == (
+        "coder:\n  model: sonnet\n  tools:\n    - read\n    - write\n"
+        "reviewer:\n  model: opus\n  prompt: |\n    Review.\n    Be nice.\n"
+    )
+    whole = YAML(typ="safe").load(troupe(theatre, "show").stdout)
+    assert whole["flow"] == {"x": 1, "y": [1, 2]} and whole["quoted"] == "single"
+    assert whole["agents"]["coder"]["tools"] == ["read", "write"]
+
+
+def test_show_sources(theatre):
+    r = troupe(theatre, "show", "--sources")
+    assert r.returncode == 0
+    lines = r.stdout.decode().splitlines()
+    assert "name: demo # from .troupe/troupe.yml" in lines
+    assert "    model: sonnet # from .troupe/agents/coder.yaml" in lines
+    assert "      - write # from .troupe/agents/coder.yaml" in lines
+    assert "    prompt: | # from .troupe/agents/prompt.md" in lines
+    assert "agents:" in lines and "      Be nice." in lines
+    assert troupe(theatre, "show", "tags", "--sources").stdout == (
+        b"- a # from .troupe/troupe.yml\n- b # from .troupe/troupe.yml\n"
+    )
 
 
 def test_set_keeps_comment_column(theatre):

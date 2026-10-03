@@ -12,6 +12,7 @@ from ruamel.yaml.nodes import SequenceNode
 
 from .editor import Editor
 from .errors import LoadError, PathError, TroupeError, UsageError, WriteRefused
+from .render import Shower
 from .yamldoc import VNode, compose, construct, leaves, values_equal
 
 
@@ -28,8 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True, parser_class=_Parser)
     config = sub.add_parser("config", parents=[theatre], help="inspect and change configuration")
     csub = config.add_subparsers(dest="action", required=True, parser_class=_Parser)
-    show = csub.add_parser("show", parents=[theatre], help="print a setting")
-    show.add_argument("path")
+    get = csub.add_parser("get", parents=[theatre], help="print a setting's value")
+    get.add_argument("path")
+    show = csub.add_parser("show", parents=[theatre], help="print a setting or section as YAML")
+    show.add_argument("path", nargs="?")
+    show.add_argument("--sources", action="store_true", help="say which file each value comes from")
     st = csub.add_parser("set", parents=[theatre], help="change a setting")
     st.add_argument("path")
     st.add_argument("value")
@@ -90,6 +94,11 @@ def lookup(root: VNode, segs: list[str]) -> VNode:
     return node
 
 
+def source_of(v: VNode, theatre: str) -> str:
+    path = v.include_path if v.include else v.doc.path
+    return os.path.relpath(path, theatre).replace(os.sep, "/")
+
+
 def out(text: str) -> None:
     sys.stdout.buffer.write(text.encode("utf-8"))
 
@@ -120,11 +129,22 @@ def run(args: argparse.Namespace) -> int:
 
 def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, editor: Editor, root: VNode | None, app: Any, config: Any) -> int:
 
-    if args.action == "show":
+    if args.action == "get":
         node = lookup(root, path_segs)
         if node.kind != "scalar":
-            raise PathError(f"{args.path}: is a {'mapping' if node.kind == 'map' else 'list'}, not a scalar")
+            kind = "mapping" if node.kind == "map" else "list"
+            raise PathError(f"{args.path}: is a {kind}, not a scalar (use `troupe config show {args.path}`)")
         out(format_scalar(node.value))
+        return 0
+
+    if args.action == "show":
+        node = lookup(root, path_segs) if path_segs is not None else root
+        if node.kind == "scalar" and not args.sources:
+            out(format_scalar(node.value))
+            return 0
+        theatre = os.path.dirname(os.path.dirname(editor.config_path))
+        source = (lambda v: source_of(v, theatre)) if args.sources else None
+        out(Shower(source).document(node))
         return 0
 
     if args.action == "history":

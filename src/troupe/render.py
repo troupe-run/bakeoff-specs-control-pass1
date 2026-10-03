@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import unicodedata
-from typing import Any
+from typing import Any, Callable
 
 from ruamel.yaml.error import YAMLError
 from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode
@@ -221,3 +221,75 @@ class Renderer:
             for v in value:
                 lines += self.item(v, indent)
         return lines
+
+
+# --------------------------------------------------------------------------
+# Showing a configuration view as YAML
+
+
+def _text_literal(value: str, indent: int) -> tuple[str, list[str]] | None:
+    """A literal block for text without stray control characters; line breaks are normalised."""
+    value = value.replace("\r\n", "\n")
+    if any((is_control(c) and c not in "\t\n") or c in "\u2028\u2029\ufeff" for c in value):
+        return None
+    body = value.rstrip("\n")
+    t = len(value) - len(body)
+    if not body:
+        return ("|-" if t == 0 else "|+"), [""] * t
+    lines = body.split("\n")
+    first = next((i for i, ln in enumerate(lines) if ln.strip(" ")), len(lines) - 1)
+    explicit = any(ln.startswith(" ") for ln in lines[: first + 1])
+    return "|" + ("2" if explicit else "") + chomp_for(value), literal_lines(value, indent + 2)
+
+
+class Shower:
+    """Renders a view node as block-style YAML, optionally tagging scalars with their source file."""
+
+    def __init__(self, source: Callable[[Any], str] | None = None):
+        self.source = source
+
+    def tag(self, v: Any) -> str:
+        return f" # from {self.source(v)}" if self.source else ""
+
+    def scalar_head(self, v: Any, indent: int) -> tuple[str, list[str]]:
+        value = v.value
+        if isinstance(value, str) and (v.include == "text" or ("\n" in value and "\r" not in value)):
+            lit = _text_literal(value, indent)
+            if lit is not None:
+                return lit
+        if is_multiline(value):
+            return double(value), []
+        return scalar(value, None, False), []
+
+    def after_indicator(self, v: Any, indent: int, compact: bool) -> tuple[str, list[str]]:
+        if v.kind != "scalar":
+            if not v.children:
+                return ("{}" if v.kind == "map" else "[]"), []
+            if compact:
+                lines = self.block(v, indent + 2)
+                return lines[0][indent + 2 :], lines[1:]
+            return "", self.block(v, indent + 2)
+        head, rest = self.scalar_head(v, indent)
+        return head + self.tag(v), rest
+
+    def block(self, v: Any, indent: int) -> list[str]:
+        lines: list[str] = []
+        if v.kind == "map":
+            for k, c in v.children.items():
+                head, rest = self.after_indicator(c, indent, False)
+                lines.append(" " * indent + scalar(k, None, False) + ":" + (" " + head if head else ""))
+                lines += rest
+        else:
+            for c in v.children:
+                head, rest = self.after_indicator(c, indent, True)
+                lines.append(" " * indent + "-" + (" " + head if head else ""))
+                lines += rest
+        return lines
+
+    def document(self, v: Any) -> str:
+        if v.kind == "scalar" or not v.children:
+            head, rest = self.after_indicator(v, 0, False)
+            lines = [head] + rest
+        else:
+            lines = self.block(v, 0)
+        return "".join(ln + "\n" for ln in lines)
