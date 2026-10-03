@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("value")
     hist = csub.add_parser("history", parents=[theatre], help="list changes")
     hist.add_argument("path", nargs="?")
+    csub.add_parser("watch", parents=[theatre], help="follow edits to the configuration files")
     return p
 
 
@@ -95,17 +96,29 @@ def out(text: str) -> None:
 
 def run(args: argparse.Namespace) -> int:
     from .store import Troupe
+    from .sync import locked, reconcile, watch
 
     theatre = getattr(args, "theatre", None)
     if theatre is None:
         theatre = os.environ.get("TROUPE_THEATRE") or "."
+    if args.action == "watch":
+        return watch(theatre, config_file, out)
     path_segs = parse_path(args.path) if getattr(args, "path", None) is not None else None
     value = parse_value(args.value) if args.action == "set" else None
     cfg = config_file(theatre)
-    editor = Editor(cfg)
-    root = editor.load()
-    app = Troupe(os.path.dirname(cfg))
-    config = app.ensure_imported(leaves(root))
+    state_dir = os.path.dirname(cfg)
+    with locked(state_dir):
+        editor = Editor(cfg)
+        app = Troupe(state_dir)
+        if args.action == "history":  # reports what has been recorded; never reconciles
+            root = None
+            config = app.configuration() or app.ensure_imported(leaves(editor.load()))
+        else:
+            root, config = reconcile(app, editor)
+        return act(args, path_segs, value, editor, root, app, config)
+
+
+def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, editor: Editor, root: VNode | None, app: Any, config: Any) -> int:
 
     if args.action == "show":
         node = lookup(root, path_segs)

@@ -145,3 +145,89 @@ def test_theatre_env_default(theatre, tmp_path_factory):
     assert run({"TROUPE_THEATRE": str(theatre)}).stdout == b"demo\n"
     assert run({"TROUPE_THEATRE": ""}).returncode == 4
     assert run({"TROUPE_THEATRE": "/nonexistent"}, "--theatre", str(theatre)).stdout == b"demo\n"
+
+
+def events(theatre, path=None):
+    r = troupe(theatre, "history", *([path] if path else []))
+    assert r.returncode == 0, r.stderr
+    return [(e["op"], e["path"], e["old"], e["new"]) for e in map(json.loads, r.stdout.decode().splitlines())]
+
+
+def edits(theatre):
+    return [e for e in events(theatre) if e[0] != "import"]
+
+
+def test_reconcile_on_command(theatre):
+    troupe(theatre, "show", "name")
+    p = theatre / ".troupe/troupe.yml"
+    p.write_text(cfg(theatre).replace("name: demo   # the name", "name:   demo # renamed comment\n# extra"))
+    assert troupe(theatre, "show", "name").stdout == b"demo\n"
+    assert edits(theatre) == []
+    p.write_text(cfg(theatre).replace("demo", "play").replace("  - a\n", ""))
+    assert edits(theatre) == []  # history does not reconcile
+    assert troupe(theatre, "show", "name").stdout == b"play\n"
+    assert edits(theatre) == [("set", "name", "demo", "play"), ("set", "tags.0", "a", "b"), ("remove", "tags.1", "b", None)]
+    (theatre / ".troupe/agents/coder.yaml").write_text("model: opus\ntools: [read, write]\n")
+    set_ok(theatre, "name", "x")
+    assert edits(theatre)[3:] == [("set", "agents.coder.model", "sonnet", "opus"), ("set", "name", "play", "x")]
+
+
+@pytest.fixture
+def watcher(theatre):
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "troupe.cli_main", "config", "watch", "--theatre", str(theatre)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert proc.stdout.readline() == f"watching {theatre}\n".encode()
+    yield proc
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+
+
+def wait_for(fn, timeout=2.0):
+    import time
+    end = time.monotonic() + timeout
+    while True:
+        if fn():
+            return
+        if time.monotonic() > end:
+            raise AssertionError("timed out")
+        time.sleep(0.05)
+
+
+def test_watch(theatre, watcher):
+    import signal
+    import time
+    d = theatre / ".troupe"
+    (d / "troupe.yml").write_text(cfg(theatre).replace("demo", "play"))
+    wait_for(lambda: edits(theatre) == [("set", "name", "demo", "play")])
+    (d / "agents/prompt.md").write_bytes(b"New.\r\n")
+    wait_for(lambda: edits(theatre)[1:] == [("set", "agents.reviewer.prompt", "Review.\r\nBe nice.\r\n", "New.\r\n")])
+    # a set while watching: only its own events
+    set_ok(theatre, "agents.coder.model", "haiku")
+    time.sleep(0.5)
+    assert edits(theatre)[2:] == [("set", "agents.coder.model", "sonnet", "haiku")]
+    # formatting-only edit: nothing
+    (d / "troupe.yml").write_text(cfg(theatre).replace("quoted: 'single'", 'quoted: "single"  # q'))
+    time.sleep(0.5)
+    assert len(edits(theatre)) == 3
+    # a hand-added include is followed, and then watched itself
+    (d / "extra.yml").write_text("k: 1\n")
+    (d / "troupe.yml").write_text(cfg(theatre) + "extra: file:extra.yml\n")
+    wait_for(lambda: edits(theatre)[3:] == [("set", "extra.k", None, 1)])
+    (d / "extra.yml").write_text("k: 2\n")
+    wait_for(lambda: edits(theatre)[4:] == [("set", "extra.k", 1, 2)])
+    # broken YAML is reported but the watch continues
+    (d / "extra.yml").write_text("k: [\n")
+    time.sleep(0.5)
+    (d / "extra.yml").write_text("k: 3\n")
+    wait_for(lambda: edits(theatre)[5:] == [("set", "extra.k", 2, 3)])
+    watcher.send_signal(signal.SIGTERM)
+    assert watcher.wait(timeout=5) == 0
+
+
+def test_watch_sigint(theatre, watcher):
+    import signal
+    watcher.send_signal(signal.SIGINT)
+    assert watcher.wait(timeout=5) == 0

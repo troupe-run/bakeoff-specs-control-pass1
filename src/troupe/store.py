@@ -72,6 +72,12 @@ class Troupe(Application[UUID]):
             self.save(config)
         return config
 
+    def reconcile(self, leaves: dict[str, Any]) -> Configuration:
+        """Bring the projection in line with the files, recording what differs."""
+        config = self.ensure_imported(leaves)
+        self.record(config, dict(config.leaves), leaves)
+        return config
+
     def record(self, config: Configuration, old: dict[str, Any], new: dict[str, Any]) -> None:
         for path, value in new.items():
             if path not in old:
@@ -81,4 +87,5 @@ class Troupe(Application[UUID]):
         for path, value in old.items():
             if path not in new:
                 config.value_removed(path, value)
-        self.save(config)
+        if config.pending_events:
+            self.save(config)

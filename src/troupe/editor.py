@@ -153,14 +153,18 @@ class Editor:
         self.config_path = config_path
         self.overlay: dict[str, str] = {}
         self.disk: dict[str, str] = {}
+        self.seen: dict[str, bytes | None] = {}  # raw bytes of every file read (None: unreadable)
 
     # files -------------------------------------------------------------
     def read(self, path: str) -> str:
         if path in self.overlay:
             return self.overlay[path]
         if path not in self.disk:
+            self.seen[path] = None
             with open(path, "rb") as f:
-                self.disk[path] = f.read().decode("utf-8")
+                raw = f.read()
+            self.seen[path] = raw
+            self.disk[path] = raw.decode("utf-8")
         return self.disk[path]
 
     def load(self) -> VNode:
