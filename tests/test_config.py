@@ -308,9 +308,14 @@ def test_lineage(theatre):
 
 
 @pytest.mark.parametrize("actor", ["", "human", "human:", "robot:x", "agent"])
-def test_bad_actor(theatre, actor):
+@pytest.mark.parametrize("args", [["set", "name", "x"], ["get", "name"], ["show"], ["history"], ["watch"]])
+def test_bad_actor(theatre, actor, args):
     before = cfg(theatre)
-    r = set_as(theatre, actor, "name", "x")
-    assert r.returncode == 2 and b"TROUPE_ACTOR" in r.stderr
+    r = subprocess.run(
+        [sys.executable, "-m", "troupe.cli_main", "config", *args, "--theatre", str(theatre)],
+        capture_output=True, env={**os.environ, "TROUPE_ACTOR": actor}, timeout=10,
+    )
+    assert (r.returncode, r.stdout) == (2, b"") and b"TROUPE_ACTOR" in r.stderr
     assert cfg(theatre) == before
+    assert not (theatre / ".troupe/events.sqlite").exists()  # nothing recorded, not even the import
 

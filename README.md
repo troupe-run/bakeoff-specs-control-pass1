@@ -22,8 +22,8 @@ write-back is already recorded by the time `watch` sees it and yields no further
 
 Every recorded event carries its lineage: `actor` (`{"kind": "human"|"agent"|"unknown", "id": …}`), `via`
 (`import`, `cli` or `file`), `at` (UTC, RFC 3339), `reason` (from `set --reason`) and `change` (shared by all events
-of one command, file reconcile or import). A `set`'s actor comes from `TROUPE_ACTOR` (`human:<id>` or
-`agent:<id>`; anything else exits 2), defaulting to the login name as a human. Imports and file edits have an
+of one command, file reconcile or import). A CLI command's actor comes from `TROUPE_ACTOR` (`human:<id>` or
+`agent:<id>`; anything else makes every command exit 2), defaulting to the login name as a human. Imports and file edits have an
 unknown actor. Events recorded before lineage existed report an unknown actor, their stored timestamp, and — for
 `set`/`remove` — `via: null`, since whether they came from the CLI or a file was never recorded.
 

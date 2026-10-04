@@ -109,6 +109,7 @@ def run(args: argparse.Namespace) -> int:
     from .store import Troupe
     from .sync import locked, reconcile, watch
 
+    actor = parse_actor(os.environ.get("TROUPE_ACTOR"))  # every command rejects a malformed one
     theatre = getattr(args, "theatre", None)
     if theatre is None:
         theatre = os.environ.get("TROUPE_THEATRE") or "."
@@ -116,7 +117,6 @@ def run(args: argparse.Namespace) -> int:
         return watch(theatre, config_file, out)
     path_segs = parse_path(args.path) if getattr(args, "path", None) is not None else None
     value = parse_value(args.value) if args.action == "set" else None
-    actor = parse_actor(os.environ.get("TROUPE_ACTOR")) if args.action == "set" else None
     cfg = config_file(theatre)
     state_dir = os.path.dirname(cfg)
     with locked(state_dir):
