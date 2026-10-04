@@ -13,6 +13,7 @@ from ruamel.yaml.nodes import SequenceNode
 from .editor import Editor
 from .errors import LoadError, PathError, TroupeError, UsageError, WriteRefused
 from .render import Shower
+from .lineage import lineage, parse_actor
 from .yamldoc import VNode, compose, construct, leaves, values_equal
 
 
@@ -37,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     st = csub.add_parser("set", parents=[theatre], help="change a setting")
     st.add_argument("path")
     st.add_argument("value")
+    st.add_argument("--reason", help="why the change is made (recorded in history)")
     hist = csub.add_parser("history", parents=[theatre], help="list changes")
     hist.add_argument("path", nargs="?")
     csub.add_parser("watch", parents=[theatre], help="follow edits to the configuration files")
@@ -114,6 +116,7 @@ def run(args: argparse.Namespace) -> int:
         return watch(theatre, config_file, out)
     path_segs = parse_path(args.path) if getattr(args, "path", None) is not None else None
     value = parse_value(args.value) if args.action == "set" else None
+    actor = parse_actor(os.environ.get("TROUPE_ACTOR")) if args.action == "set" else None
     cfg = config_file(theatre)
     state_dir = os.path.dirname(cfg)
     with locked(state_dir):
@@ -124,10 +127,10 @@ def run(args: argparse.Namespace) -> int:
             config = app.configuration() or app.ensure_imported(leaves(editor.load()))
         else:
             root, config = reconcile(app, editor)
-        return act(args, path_segs, value, editor, root, app, config)
+        return act(args, path_segs, value, actor, editor, root, app, config)
 
 
-def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, editor: Editor, root: VNode | None, app: Any, config: Any) -> int:
+def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor: dict[str, Any] | None, editor: Editor, root: VNode | None, app: Any, config: Any) -> int:
 
     if args.action == "get":
         node = lookup(root, path_segs)
@@ -178,7 +181,7 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, edito
     for fpath, text in editor.changed().items():
         with open(fpath, "w", encoding="utf-8", newline="") as f:
             f.write(text)
-    app.record(config, old, new)
+    app.record(config, old, new, lineage("cli", actor, args.reason))
     return 0
 
 

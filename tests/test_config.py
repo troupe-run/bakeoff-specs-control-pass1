@@ -262,3 +262,55 @@ def test_watch_sigint(theatre, watcher):
     import signal
     watcher.send_signal(signal.SIGINT)
     assert watcher.wait(timeout=5) == 0
+
+
+def history(theatre, *path, env=None):
+    r = subprocess.run(
+        [sys.executable, "-m", "troupe.cli_main", "config", "history", *path, "--theatre", str(theatre)],
+        capture_output=True, env={**os.environ, **(env or {})},
+    )
+    assert r.returncode == 0, r.stderr
+    return [json.loads(line) for line in r.stdout.decode().splitlines()]
+
+
+def set_as(theatre, actor, *args):
+    env = {k: v for k, v in os.environ.items() if k != "TROUPE_ACTOR"}
+    if actor is not None:
+        env["TROUPE_ACTOR"] = actor
+    return subprocess.run(
+        [sys.executable, "-m", "troupe.cli_main", "config", "set", *args, "--theatre", str(theatre)],
+        capture_output=True, env=env,
+    )
+
+
+def test_lineage(theatre):
+    import getpass
+    import re
+    assert set_as(theatre, "agent:coder-7", "tags", "[x]", "--reason", "tidy tags").returncode == 0
+    (theatre / ".troupe/troupe.yml").write_text(cfg(theatre).replace("demo", "play"))
+    assert set_as(theatre, None, "name", "x").returncode == 0
+    ev = history(theatre)
+    imports = [e for e in ev if e["via"] == "import"]
+    assert imports and {e["op"] for e in imports} == {"import"}
+    assert len({e["change"] for e in imports}) == 1
+    assert all(e["actor"] == {"kind": "unknown", "id": None} and e["reason"] is None for e in imports)
+    agent = [e for e in ev if e["path"].startswith("tags.")][len([e for e in imports if e["path"].startswith("tags.")]):]
+    assert [(e["op"], e["path"]) for e in agent] == [("set", "tags.0"), ("remove", "tags.1")]
+    assert all(e["actor"] == {"kind": "agent", "id": "coder-7"} and e["via"] == "cli" and e["reason"] == "tidy tags" for e in agent)
+    assert agent[0]["change"] == agent[1]["change"] != imports[0]["change"]
+    filed, human = ev[-2], ev[-1]
+    assert (filed["path"], filed["via"], filed["actor"], filed["reason"]) == ("name", "file", {"kind": "unknown", "id": None}, None)
+    assert (human["path"], human["via"], human["actor"], human["reason"]) == ("name", "cli", {"kind": "human", "id": getpass.getuser()}, None)
+    assert len({imports[0]["change"], agent[0]["change"], filed["change"], human["change"]}) == 4
+    for e in ev:
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z", e["at"])
+    assert [e["at"] for e in ev] == sorted(e["at"] for e in ev)
+
+
+@pytest.mark.parametrize("actor", ["", "human", "human:", "robot:x", "agent"])
+def test_bad_actor(theatre, actor):
+    before = cfg(theatre)
+    r = set_as(theatre, actor, "name", "x")
+    assert r.returncode == 2 and b"TROUPE_ACTOR" in r.stderr
+    assert cfg(theatre) == before
+

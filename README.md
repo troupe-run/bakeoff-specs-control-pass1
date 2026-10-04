@@ -5,7 +5,7 @@ AI orchestration tool. Step 1: the configuration subsystem.
 ```
 uv run troupe config get PATH [--theatre DIR]
 uv run troupe config show [PATH] [--sources] [--theatre DIR]
-uv run troupe config set PATH VALUE [--theatre DIR]
+uv run troupe config set PATH VALUE [--reason TEXT] [--theatre DIR]
 uv run troupe config history [PATH] [--theatre DIR]
 uv run troupe config watch [--theatre DIR]
 ```
@@ -20,8 +20,15 @@ Files and the recorded configuration are kept in sync: every command except `his
 its includes and reconciles on change. Commands serialise on `.troupe/events.lock`, so a `set`'s own
 write-back is already recorded by the time `watch` sees it and yields no further events.
 
+Every recorded event carries its lineage: `actor` (`{"kind": "human"|"agent"|"unknown", "id": …}`), `via`
+(`import`, `cli` or `file`), `at` (UTC, RFC 3339), `reason` (from `set --reason`) and `change` (shared by all events
+of one command, file reconcile or import). A `set`'s actor comes from `TROUPE_ACTOR` (`human:<id>` or
+`agent:<id>`; anything else exits 2), defaulting to the login name as a human. Imports and file edits have an
+unknown actor. Events recorded before lineage existed report an unknown actor, their stored timestamp, and — for
+`set`/`remove` — `via: null`, since whether they came from the CLI or a file was never recorded.
+
 Layout: `yamldoc.py` (position-aware parse + include view), `render.py` (scalar/collection rendering, `show` output),
-`editor.py` (write-back), `store.py` (event-sourced projection),
+`editor.py` (write-back), `store.py` (event-sourced projection), `lineage.py` (actor, timestamp, change id),
 `sync.py` (lock, reconcile, watch), `cli.py`.
 
 Tests: `uv run pytest`.
