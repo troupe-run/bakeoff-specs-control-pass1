@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("path")
     st.add_argument("value")
     st.add_argument("--reason", help="why the change is made (recorded in history)")
+    st.add_argument("--in-include", action="store_true", help="write a new key into the included file, not as an override")
     hist = csub.add_parser("history", parents=[theatre], help="list changes")
     hist.add_argument("path", nargs="?")
     csub.add_parser("watch", parents=[theatre], help="follow edits to the configuration files")
@@ -159,7 +160,7 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor
 
     # set
     old = leaves(root)
-    editor.set(path_segs, value)
+    editor.set(path_segs, value, args.in_include)
     new_root = editor.load()
     try:
         target = lookup(new_root, path_segs)

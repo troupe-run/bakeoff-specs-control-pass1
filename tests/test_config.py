@@ -371,3 +371,16 @@ def test_mapping_form_includes(theatre):
     (d / "troupe.yml").write_text(cfg(theatre) + "  x: 1\n")  # overrides on a text include
     r = troupe(theatre, "show")
     assert r.returncode == 4 and b"prompt.md" in r.stderr
+
+
+def test_set_in_include(theatre):
+    d = theatre / ".troupe"
+    (d / "base.yaml").write_text("sub: {a: 1}\n")
+    (d / "troupe.yml").write_text(cfg(theatre) + "b:\n  $ref: file:base.yaml\n  sub:\n    q: 1\n")
+    for path, value in [("agents.coder.temperature", "0.3"), ("b.sub.z", "3"), ("b.w", "4"), ("b.sub.q", "5")]:
+        r = troupe(theatre, "set", "--in-include", path, value)
+        assert r.returncode == 0, r.stderr
+    assert (d / "agents/coder.yaml").read_text() == "model: sonnet\ntools: [read, write]\ntemperature: 0.3\n"
+    assert (d / "base.yaml").read_text() == "sub: {a: 1, z: 3}\nw: 4\n"
+    assert "  coder: file:agents/coder.yaml\n" in cfg(theatre)
+    assert cfg(theatre).endswith("b:\n  $ref: file:base.yaml\n  sub:\n    q: 5\n")

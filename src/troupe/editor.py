@@ -181,7 +181,8 @@ class Editor:
         self.overlay[doc.path] = text
 
     # operations ----------------------------------------------------------
-    def set(self, segs: list[str], value: Any) -> None:
+    def set(self, segs: list[str], value: Any, in_include: bool = False) -> None:
+        """Set a value; `in_include` puts new keys in the included file rather than an override."""
         node = self.load()
         i = 0
         while i < len(segs):
@@ -191,11 +192,11 @@ class Editor:
             node = c
             i += 1
         if i == len(segs):
-            self.assign(segs, node, value)
+            self.assign(segs, node, value, in_include)
         else:
-            self.create(segs, node, i, value)
+            self.create(segs, node, i, value, in_include)
 
-    def assign(self, segs: list[str], vn: VNode, value: Any) -> None:
+    def assign(self, segs: list[str], vn: VNode, value: Any, in_include: bool = False) -> None:
         path = ".".join(segs)
         if vn.include == "text":
             if not isinstance(value, str):
@@ -214,7 +215,7 @@ class Editor:
         if vn.kind == "map" and isinstance(value, dict) and value and vn.children:
             old_keys = list(vn.children)
             for k, v in value.items():
-                self.set(segs + [k], v)
+                self.set(segs + [k], v, in_include)
             for k in old_keys:
                 if k not in value:
                     self.remove(segs + [k])
@@ -222,13 +223,13 @@ class Editor:
         if vn.kind == "seq" and isinstance(value, list) and value and vn.children:
             n = len(vn.children)
             for i, v in enumerate(value):
-                self.set(segs + [str(i)], v)
+                self.set(segs + [str(i)], v, in_include)
             for i in reversed(range(len(value), n)):
                 self.remove(segs + [str(i)])
             return
         self.replace(vn, value)
 
-    def create(self, segs: list[str], parent: VNode, i: int, value: Any) -> None:
+    def create(self, segs: list[str], parent: VNode, i: int, value: Any, in_include: bool = False) -> None:
         path = ".".join(segs)
         new = value
         for seg in reversed(segs[i + 1 :]):
@@ -240,7 +241,12 @@ class Editor:
                 new = {seg: new}
         seg = segs[i]
         if parent.kind == "map":
-            self.insert_key(parent, seg, new)
+            if in_include:
+                while parent.base is not None:  # the included side of a merged mapping
+                    parent = parent.base
+                self.insert(parent, seg, new)
+            else:
+                self.insert_key(parent, seg, new)
         elif parent.kind == "seq":
             if not seg.isdigit():
                 raise PathError(f"{path}: {'.'.join(segs[:i]) or 'root'} is a list")

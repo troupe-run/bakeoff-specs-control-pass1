@@ -189,6 +189,7 @@ class VNode:
     container: Node | None = None  # ruamel collection in src_doc holding this entry
     include_doc: Doc | None = None  # for include roots: the included YAML document
     ref_entry: "VNode | None" = None  # for mapping-form includes: the `$ref` entry itself
+    base: "VNode | None" = None  # for merged mappings: the included mapping the overrides merge into
 
     def py(self) -> Any:
         if self.kind == "map":
@@ -424,6 +425,7 @@ class Loader:
             return inc
         over.include, over.include_path, over.include_doc = "yaml", inc.include_path, inc.include_doc
         over.ref_entry = ref
+        over.base = inc if inc.kind == "map" else None
         over.children = merge(inc.children if inc.kind == "map" else {}, children, over)
         return over
 
@@ -445,6 +447,7 @@ def merge(base: dict[str, VNode], over: dict[str, VNode], parent: VNode) -> dict
         b = out.get(k)
         if b is not None and b.kind == "map" and o.kind == "map":
             o.children = merge(b.children, o.children, o)
+            o.base = b
         out[k] = o
     for c in out.values():
         c.parent = parent
