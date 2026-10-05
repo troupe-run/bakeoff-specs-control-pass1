@@ -18,7 +18,8 @@ An include may also be written in mapping form, `{$ref: file:x.yaml, …}`: the 
 into the included content (mappings merge; scalars and lists replace). Included files are shared, so a new key under
 included content is written as an override next to the nearest include reference (a scalar-form include is first
 turned into mapping form); appended list items and new keys inside list items still go to the file holding the list.
-`set --in-include` puts a new key into the included file itself instead.
+`set --in-include` puts a new key into the included file itself instead (refused, exit 3, if that would change
+settings elsewhere that include the same file). Choices made where the contract is silent are in `DECISIONS.md`.
 Overrides on a non-YAML include are a load error (exit 4). Every change is recorded
 as events (via `eventsourcing`, SQLite at `.troupe/events.sqlite`).
 

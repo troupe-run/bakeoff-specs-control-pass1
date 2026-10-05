@@ -384,3 +384,14 @@ def test_set_in_include(theatre):
     assert (d / "base.yaml").read_text() == "sub: {a: 1, z: 3}\nw: 4\n"
     assert "  coder: file:agents/coder.yaml\n" in cfg(theatre)
     assert cfg(theatre).endswith("b:\n  $ref: file:base.yaml\n  sub:\n    q: 5\n")
+
+
+def test_set_in_include_refuses_to_disturb_other_includers(theatre):
+    d = theatre / ".troupe"
+    (d / "troupe.yml").write_text(cfg(theatre) + "twin: file:agents/coder.yaml\n")
+    before = (cfg(theatre), (d / "agents/coder.yaml").read_text())
+    r = troupe(theatre, "set", "--in-include", "agents.coder.temperature", "0.3")
+    assert r.returncode == 3 and b"twin.temperature" in r.stderr
+    assert (cfg(theatre), (d / "agents/coder.yaml").read_text()) == before
+    set_ok(theatre, "agents.coder.temperature", "0.3")  # as an override it is fine
+    assert troupe(theatre, "get", "twin.temperature").returncode == 5
