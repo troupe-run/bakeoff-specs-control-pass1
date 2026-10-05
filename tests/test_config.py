@@ -319,3 +319,55 @@ def test_bad_actor(theatre, actor, args):
     assert cfg(theatre) == before
     assert not (theatre / ".troupe/events.sqlite").exists()  # nothing recorded, not even the import
 
+
+
+def test_new_key_under_include_is_an_override(theatre):
+    coder = theatre / ".troupe/agents/coder.yaml"
+    coder.write_text("model: sonnet\nlimits:\n  tokens: 5\ntools: [read, write]\nsteps:\n  - name: a\n")
+    shared = coder.read_text()
+    p = theatre / ".troupe/troupe.yml"
+    p.write_text(cfg(theatre).replace("coder: file:agents/coder.yaml", "coder: file:agents/coder.yaml  # c"))
+    set_ok(theatre, "agents.coder.temperature", "0.3")
+    assert "  coder:  # c\n    $ref: file:agents/coder.yaml\n    temperature: 0.3\n  reviewer:" in cfg(theatre)
+    set_ok(theatre, "agents.coder.limits.time", "9")
+    assert "    temperature: 0.3\n    limits:\n      time: 9\n  reviewer:" in cfg(theatre)
+    assert coder.read_text() == shared
+    # an overridden value changes the override; one that is not is changed where it lives
+    set_ok(theatre, "agents.coder.temperature", "0.5")
+    assert "    temperature: 0.5\n" in cfg(theatre)
+    set_ok(theatre, "agents.coder.limits.tokens", "7")
+    assert "  tokens: 7\n" in coder.read_text()
+    # lists: appending, and new keys in list items, go to the file holding the list
+    set_ok(theatre, "agents.coder.tools.2", "run")
+    set_ok(theatre, "agents.coder.steps.0.n", "1")
+    assert coder.read_text() == "model: sonnet\nlimits:\n  tokens: 7\ntools: [read, write, run]\nsteps:\n  - name: a\n    n: 1\n"
+    assert troupe(theatre, "get", "agents.coder.limits.time").stdout == b"9\n"
+    assert troupe(theatre, "get", "agents.coder.model").stdout == b"sonnet\n"
+
+
+def test_mapping_form_includes(theatre):
+    d = theatre / ".troupe"
+    (d / "base.yaml").write_text("model: sonnet\nlimits: {tokens: 5, time: 1}\nlist: [1]\n")
+    (d / "troupe.yml").write_text(
+        "a:\n  $ref: file:base.yaml\n  model: opus\n  limits:\n    time: 2\n  list: [9]\n"
+        "b: {$ref: file:base.yaml}\n"
+        "c:\n  - file:base.yaml # ic\n"
+        "t:\n  $ref: file:agents/prompt.md\n"
+    )
+    r = troupe(theatre, "show", "a")
+    assert r.stdout == b"model: opus\nlimits:\n  tokens: 5\n  time: 2\nlist:\n  - 9\n"
+    assert troupe(theatre, "get", "t").stdout == b"Review.\r\nBe nice.\r\n"
+    set_ok(theatre, "a.model", "haiku")
+    set_ok(theatre, "a.limits.x", "3")
+    set_ok(theatre, "b.x", "4")
+    set_ok(theatre, "c.0.x", "5")
+    assert (d / "base.yaml").read_text() == "model: sonnet\nlimits: {tokens: 5, time: 1}\nlist: [1]\n"
+    assert cfg(theatre) == (
+        "a:\n  $ref: file:base.yaml\n  model: haiku\n  limits:\n    time: 2\n    x: 3\n  list: [9]\n"
+        "b: {$ref: file:base.yaml, x: 4}\n"
+        "c:\n  - $ref: file:base.yaml # ic\n    x: 5\n"
+        "t:\n  $ref: file:agents/prompt.md\n"
+    )
+    (d / "troupe.yml").write_text(cfg(theatre) + "  x: 1\n")  # overrides on a text include
+    r = troupe(theatre, "show")
+    assert r.returncode == 4 and b"prompt.md" in r.stderr

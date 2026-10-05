@@ -20,6 +20,7 @@ from .render import (
 )
 from .yamldoc import (
     Doc,
+    construct,
     Loader,
     VNode,
     indent_of,
@@ -239,7 +240,7 @@ class Editor:
                 new = {seg: new}
         seg = segs[i]
         if parent.kind == "map":
-            self.insert(parent, seg, new)
+            self.insert_key(parent, seg, new)
         elif parent.kind == "seq":
             if not seg.isdigit():
                 raise PathError(f"{path}: {'.'.join(segs[:i]) or 'root'} is a list")
@@ -249,6 +250,68 @@ class Editor:
         else:
             raise PathError(f"{path}: {'.'.join(segs[:i])} is not a mapping or list")
 
+    def insert_key(self, parent: VNode, key: str, value: Any) -> None:
+        """Add a new key; under included content it becomes an override in the including file."""
+        include, rel, a = parent, [], parent
+        while include is not None and not (include.include == "yaml" and include.include_doc is not None):
+            include = include.parent
+        if include is not None:
+            while a is not include and a.doc is include.include_doc:  # climb to the nearest override
+                p = a.parent
+                if p.kind != "map":  # overrides cannot address list items
+                    break
+                rel.insert(0, next(k for k, c in p.children.items() if c is a))
+                a = p
+            else:
+                for k in reversed(rel):
+                    key, value = k, {key: value}
+                if a.doc is include.include_doc:
+                    self.to_mapping_form(a, {key: value})
+                else:
+                    self.insert(a, key, value)
+                return
+        self.insert(parent, key, value)
+
+    def to_mapping_form(self, vn: VNode, overrides: dict[str, Any]) -> None:
+        """Rewrite `key: file:x` as `key:` / `$ref: file:x` / overrides."""
+        doc = vn.src_doc
+        node = vn.src_node
+        text = doc.text
+        r = layout(doc)
+        nl = doc.newline
+        s, e = node.start_mark.index, node.end_mark.index
+        ref = text[s:e]
+        if "\n" in ref:
+            ref = scalar(construct(node), None, False)
+        if vn.flow_parent:
+            entry = r.flow(overrides)
+            self.apply(doc, [(s, e, "{$ref: " + ref + ", " + entry[1:], True)])
+            return
+        rest = text[e : doc.eol(e)]
+        if vn.key_node is not None:
+            col = vn.anchor_indent + r.step
+            lines = [" " * col + "$ref: " + ref] + r.block(overrides, col)
+            if doc.line_of(s) == doc.line_of(vn.anchor):
+                edits = [(vn.anchor, doc.eol(e) if not rest.strip() else e, "", False)]
+            else:  # value on its own line: replace that line
+                edits = [(doc.line_start(s), doc.next_line(e), "", False)]
+        else:  # a list item or the whole document
+            col = vn.anchor_indent + 2 if vn.anchor is not None else 0
+            lines = r.block(overrides, col)
+            edits = [(s, e, "$ref: " + ref, False)]
+        pos = doc.next_line(e)
+        pre = nl if pos == len(text) and not text.endswith("\n") else ""
+        edits.append((pos, pos, pre + _join(lines, nl), False))
+        self.apply(doc, edits)
+
+    @staticmethod
+    def siblings(parent: VNode, container: Node | None) -> list[VNode]:
+        """Entries of `parent` written in the same collection node, in file order."""
+        out = [e for e in parent.entries() if e.container is container]
+        if parent.ref_entry is not None and parent.ref_entry.container is container:
+            out.append(parent.ref_entry)
+        return sorted(out, key=lambda e: e.start)
+
     def remove(self, segs: list[str]) -> None:
         vn = self.load()
         for s in segs:
@@ -257,10 +320,10 @@ class Editor:
         assert parent is not None
         doc = vn.src_doc
         text = doc.text
-        entries = parent.entries()
+        entries = self.siblings(parent, vn.container)
         idx = entries.index(vn)
         st, en = vn.start, vn.end
-        if parent.node is not None and is_flow(parent.node):
+        if vn.container is not None and is_flow(vn.container):
             if idx < len(entries) - 1:
                 edit = (st, entries[idx + 1].start, "", True)
             elif idx > 0:
@@ -282,7 +345,7 @@ class Editor:
         doc = parent.doc
         node = parent.node
         r = layout(doc)
-        entries = parent.entries()
+        entries = self.siblings(parent, node)
         last = entries[-1] if entries else None
         kstyle = style_of(last.key_node) if last is not None and last.key_node is not None else None
         vstyle = style_of(last.src_node) if last is not None else None

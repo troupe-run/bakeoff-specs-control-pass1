@@ -186,6 +186,9 @@ class VNode:
     value: Any = None  # scalar value
     children: dict[str, "VNode"] | list["VNode"] = field(default_factory=dict)
     end: int = 0  # end of content in src_doc
+    container: Node | None = None  # ruamel collection in src_doc holding this entry
+    include_doc: Doc | None = None  # for include roots: the included YAML document
+    ref_entry: "VNode | None" = None  # for mapping-form includes: the `$ref` entry itself
 
     def py(self) -> Any:
         if self.kind == "map":
@@ -298,13 +301,19 @@ class Loader:
         anchor_indent: int,
         flow_parent: bool,
         stack: tuple[str, ...],
+        src_end: int | None = None,
     ) -> VNode:
+        def end_in_src() -> int:
+            return src_end if src_end is not None else content_end(src_doc, src_node, anchor, None)
+
         v = VNode("scalar", doc, node, src_doc, src_node, parent, key_node, anchor, anchor_indent, flow_parent)
         if isinstance(node, ScalarNode):
             value = construct(node)
             if isinstance(value, str) and value.startswith("file:"):
-                return self.include(v, value[5:], stack)
+                return self.include(v, value[5:], stack, end_in_src())
             v.value = value
+        elif isinstance(node, MappingNode) and ref_of(node) is not None:
+            return self.ref_include(v, node, stack, src_end)
         elif isinstance(node, MappingNode):
             v.kind = "map"
             children: dict[str, VNode] = {}
@@ -312,12 +321,13 @@ class Loader:
             for k, cn in node.value:
                 a = find_colon(doc, k.end_mark.index)
                 c = self.build(doc, cn, doc, cn, v, k, a, doc.col(k.start_mark.index), bool(node.flow_style), stack)
+                c.container = node
                 children[key_text(k)] = c
                 last_end = c.end
             v.children = children
             v.end = content_end(doc, node, anchor, last_end)
             if doc is not src_doc:
-                v.end = content_end(src_doc, src_node, anchor, None)
+                v.end = end_in_src()
             return v
         elif isinstance(node, SequenceNode):
             v.kind = "seq"
@@ -326,6 +336,7 @@ class Loader:
             if node.flow_style:
                 for cn in node.value:
                     c = self.build(doc, cn, doc, cn, v, None, None, 0, True, stack)
+                    c.container = node
                     items.append(c)
                     last_end = c.end
             else:
@@ -334,17 +345,18 @@ class Loader:
                     raise LoadError(f"{doc.path}: unsupported sequence layout")
                 for d, cn in zip(dashes, node.value):
                     c = self.build(doc, cn, doc, cn, v, None, d + 1, doc.col(d), False, stack)
+                    c.container = node
                     items.append(c)
                     last_end = c.end
             v.children = items
             v.end = content_end(doc, node, anchor, last_end)
             if doc is not src_doc:
-                v.end = content_end(src_doc, src_node, anchor, None)
+                v.end = end_in_src()
             return v
-        v.end = content_end(src_doc, src_node, anchor, None)
+        v.end = end_in_src()
         return v
 
-    def include(self, v: VNode, rel: str, stack: tuple[str, ...]) -> VNode:
+    def include(self, v: VNode, rel: str, stack: tuple[str, ...], src_end: int, overrides: bool = False) -> VNode:
         base = os.path.dirname(v.doc.path)
         target = os.path.normpath(os.path.join(base, rel))
         real = os.path.realpath(target)
@@ -360,26 +372,83 @@ class Loader:
         except UnicodeDecodeError:
             raise LoadError(f"{target}: included file is not UTF-8 (from {v.doc.path})") from None
         if not target.endswith((".yml", ".yaml")):
+            if overrides:
+                raise LoadError(f"{v.doc.path}: overrides on {target}, which is not a YAML include")
             v.include = "text"
             v.include_path = target
             v.value = text
-            v.end = content_end(v.src_doc, v.src_node, v.anchor, None)
+            v.end = src_end
             return v
         if tdoc.root is None:
             v.include = "yaml"
             v.include_path = target
+            v.include_doc = tdoc
             v.value = None
-            v.end = content_end(v.src_doc, v.src_node, v.anchor, None)
+            v.end = src_end
             return v
         inner = self.build(
             tdoc, tdoc.root, v.src_doc, v.src_node, v.parent, v.key_node, v.anchor, v.anchor_indent,
-            v.flow_parent, stack + (real,),
+            v.flow_parent, stack + (real,), src_end,
         )
-        inner.include = "yaml"
-        inner.include_path = target
-        if inner.kind == "scalar":
-            inner.end = content_end(v.src_doc, v.src_node, v.anchor, None)
+        if inner.include is None:  # else the included file is itself an include: the nearer one counts
+            inner.include = "yaml"
+            inner.include_path = target
+            inner.include_doc = tdoc
         return inner
+
+    def ref_include(self, v: VNode, node: MappingNode, stack: tuple[str, ...], src_end: int | None) -> VNode:
+        """A mapping-form include: `$ref: file:…` plus overrides deep-merged into the included content."""
+        doc = v.doc
+        ref_k, ref_v = ref_of(node)
+        a = find_colon(doc, ref_k.end_mark.index)
+        over = VNode("map", doc, node, v.src_doc, v.src_node, v.parent, v.key_node, v.anchor, v.anchor_indent, v.flow_parent)
+        ref = VNode("scalar", doc, ref_v, doc, ref_v, over, ref_k, a, doc.col(ref_k.start_mark.index), bool(node.flow_style))
+        ref.value = construct(ref_v)
+        ref.end = content_end(doc, ref_v, a, None)
+        ref.container = node
+        children: dict[str, VNode] = {}
+        last_end = ref.end
+        for k, cn in node.value:
+            if k is ref_k:
+                continue
+            ka = find_colon(doc, k.end_mark.index)
+            c = self.build(doc, cn, doc, cn, over, k, ka, doc.col(k.start_mark.index), bool(node.flow_style), stack)
+            c.container = node
+            children[key_text(k)] = c
+            last_end = max(last_end, c.end)
+        if src_end is None:
+            src_end = content_end(doc, node, v.anchor, last_end) if doc is v.src_doc else content_end(v.src_doc, v.src_node, v.anchor, None)
+        over.end = src_end
+        inc = self.include(v, ref.value[5:], stack, src_end, overrides=bool(children))
+        if inc.include == "text" or (not children and inc.kind != "map"):
+            return inc
+        over.include, over.include_path, over.include_doc = "yaml", inc.include_path, inc.include_doc
+        over.ref_entry = ref
+        over.children = merge(inc.children if inc.kind == "map" else {}, children, over)
+        return over
+
+
+def ref_of(node: MappingNode) -> tuple[Node, Node] | None:
+    """The `$ref: file:…` entry making a mapping an include, if any."""
+    for k, cn in node.value:
+        if isinstance(k, ScalarNode) and k.value == "$ref" and isinstance(cn, ScalarNode):
+            value = construct(cn)
+            if isinstance(value, str) and value.startswith("file:"):
+                return k, cn
+    return None
+
+
+def merge(base: dict[str, VNode], over: dict[str, VNode], parent: VNode) -> dict[str, VNode]:
+    """Deep-merge override entries into included ones: mappings merge, anything else replaces."""
+    out = dict(base)
+    for k, o in over.items():
+        b = out.get(k)
+        if b is not None and b.kind == "map" and o.kind == "map":
+            o.children = merge(b.children, o.children, o)
+        out[k] = o
+    for c in out.values():
+        c.parent = parent
+    return out
 
 
 def leaves(v: VNode, prefix: str = "") -> dict[str, Any]:

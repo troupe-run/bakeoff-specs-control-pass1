@@ -12,7 +12,13 @@ uv run troupe config watch [--theatre DIR]
 
 Configuration lives in `<theatre>/.troupe/troupe.yml` (or `.yaml`); `file:` strings include other files.
 `get` prints a single value; `show` prints a value or a whole section as YAML (includes resolved), and
-with `--sources` tags each scalar with `# from <file>` (relative to the theatre). `set` writes changes back byte-surgically into whichever file holds the value. Every change is recorded
+with `--sources` tags each scalar with `# from <file>` (relative to the theatre). `set` writes changes back byte-surgically into whichever file holds the value.
+
+An include may also be written in mapping form, `{$ref: file:x.yaml, …}`: the other keys are overrides, deep-merged
+into the included content (mappings merge; scalars and lists replace). Included files are shared, so a new key under
+included content is written as an override next to the nearest include reference (a scalar-form include is first
+turned into mapping form); appended list items and new keys inside list items still go to the file holding the list.
+Overrides on a non-YAML include are a load error (exit 4). Every change is recorded
 as events (via `eventsourcing`, SQLite at `.troupe/events.sqlite`).
 
 Files and the recorded configuration are kept in sync: every command except `history` first *reconciles*
