@@ -5,7 +5,7 @@ AI orchestration tool. Step 1: the configuration subsystem.
 ```
 uv run troupe config get PATH [--theatre DIR]
 uv run troupe config show [PATH] [--sources] [--theatre DIR]
-uv run troupe config set PATH VALUE [--reason TEXT] [--in-include] [--theatre DIR]
+uv run troupe config set PATH VALUE [--reason TEXT] [--in-include] [--expand-alias] [--theatre DIR]
 uv run troupe config history [PATH] [--theatre DIR]
 uv run troupe config watch [--theatre DIR]
 ```
@@ -20,7 +20,13 @@ included content is written as an override next to the nearest include reference
 turned into mapping form); appended list items and new keys inside list items still go to the file holding the list.
 `set --in-include` puts a new key into the included file itself instead (refused, exit 3, if that would change
 settings elsewhere that include the same file). Choices made where the contract is silent are in `DECISIONS.md`.
-Overrides on a non-YAML include are a load error (exit 4). Every change is recorded
+Overrides on a non-YAML include are a load error (exit 4).
+
+YAML anchors are shared values: setting a path defined at an anchor (`&name`) writes it there (the anchor is kept), so
+it changes everywhere the anchor is aliased. Setting a path reached through an alias (`*name`) is refused (exit 3);
+`set --expand-alias` first replaces that alias with a block-style copy of the anchored value, marked
+`# expanded from *name by troupe` on the key's line, and sets the value in the copy. Merge keys (`<<`) are never
+written. Every change is recorded
 as events (via `eventsourcing`, SQLite at `.troupe/events.sqlite`).
 
 Files and the recorded configuration are kept in sync: every command except `history` first *reconciles*

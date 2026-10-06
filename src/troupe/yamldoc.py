@@ -9,6 +9,7 @@ which file (and which bytes) they come from.
 from __future__ import annotations
 
 import bisect
+import copy
 import math
 import os
 import re
@@ -110,6 +111,34 @@ class Doc:
         self.newline = m.group(0) if m else "\n"
         self.line_starts = [0] + [m.end() for m in re.finditer(r"\n", text)]
         self.root = compose(text, path)
+        self.props_end: dict[int, int] = {}  # id(node) -> offset just after its `&anchor`
+        self._skip_anchors(self.root, set())
+
+    def _skip_anchors(self, node: Node | None, seen: set[int]) -> None:
+        """Start anchored nodes at their content, so that writing a value keeps the `&anchor`."""
+        if node is None or id(node) in seen:
+            return
+        seen.add(id(node))
+        if getattr(node, "anchor", None):
+            s = node.start_mark.index
+            m = re.compile(r"&[^\s,\[\]{}]+").match(self.text, s)
+            if m:
+                self.props_end[id(node)] = i = m.end()
+                mark = copy.copy(node.start_mark)
+                if isinstance(node, ScalarNode) and node.style is None and node.value == "":
+                    mark.index = i  # `key: &a` alone: an empty value right after the anchor
+                    end = copy.copy(node.end_mark)
+                    end.index = i
+                    node.end_mark = end
+                else:
+                    mark.index = skip_space(self.text, i, True)
+                node.start_mark = mark
+        if isinstance(node, MappingNode):
+            for k, v in node.value:
+                self._skip_anchors(v, seen)
+        elif isinstance(node, SequenceNode):
+            for v in node.value:
+                self._skip_anchors(v, seen)
 
     # line helpers -------------------------------------------------------
     def line_of(self, pos: int) -> int:
@@ -142,6 +171,38 @@ class Doc:
     @property
     def nlines(self) -> int:
         return len(self.line_starts)
+
+
+def skip_space(text: str, i: int, lines: bool) -> int:
+    """Skip blanks (and, if `lines`, line breaks and comments) from i."""
+    while i < len(text):
+        c = text[i]
+        if c in " \t":
+            i += 1
+        elif lines and c in "\r\n":
+            i += 1
+        elif lines and c == "#" and (i == 0 or text[i - 1] in " \t\r\n"):
+            j = text.find("\n", i)
+            i = len(text) if j < 0 else j
+        else:
+            break
+    return i
+
+
+_ALIAS = re.compile(r"\*([^\s,\[\]{}]+)")
+
+
+def alias_at(text: str, pos: int) -> tuple[int, int, str] | None:
+    """The `*name` alias token following pos (after ':', '-', ',' or '['): start, end, name."""
+    i = pos
+    while True:
+        i = skip_space(text, i, True)
+        if i < len(text) and text[i] in ",[{":
+            i += 1
+            continue
+        break
+    m = _ALIAS.match(text, i)
+    return (m.start(), m.end(), m.group(1)) if m else None
 
 
 def indent_of(line: str) -> int:
@@ -190,6 +251,9 @@ class VNode:
     include_doc: Doc | None = None  # for include roots: the included YAML document
     ref_entry: "VNode | None" = None  # for mapping-form includes: the `$ref` entry itself
     base: "VNode | None" = None  # for merged mappings: the included mapping the overrides merge into
+    dash: int | None = None  # for block list items: offset of the '-'
+    alias: str | None = None  # name of the anchor, if this value is written as an alias `*name`
+    alias_span: tuple[int, int] | None = None  # the `*name` token in src_doc
 
     def py(self) -> Any:
         if self.kind == "map":
@@ -218,12 +282,14 @@ class VNode:
         """Start of this entry in src_doc (key or dash)."""
         if self.key_node is not None:
             return self.key_node.start_mark.index
-        if self.anchor is not None and not self.flow_parent:
-            return self.anchor - 1
+        if self.dash is not None:
+            return self.dash
         return value_start(self)
 
 
 def value_start(v: VNode) -> int:
+    if v.alias_span is not None:
+        return v.alias_span[0]
     if v.src_node is None or is_empty_null(v.src_node):
         return v.anchor if v.anchor is not None else 0
     return v.src_node.start_mark.index
@@ -321,7 +387,12 @@ class Loader:
             last_end = None
             for k, cn in node.value:
                 a = find_colon(doc, k.end_mark.index)
+                alias = cn.start_mark.index < k.end_mark.index  # an alias points back at its anchor
+                if not alias:
+                    a = doc.props_end.get(id(cn), a)
                 c = self.build(doc, cn, doc, cn, v, k, a, doc.col(k.start_mark.index), bool(node.flow_style), stack)
+                if alias:
+                    mark_alias(c, doc, a)
                 c.container = node
                 children[key_text(k)] = c
                 last_end = c.end
@@ -335,17 +406,26 @@ class Loader:
             items: list[VNode] = []
             last_end = None
             if node.flow_style:
+                prev = node.start_mark.index + 1
                 for cn in node.value:
+                    alias = cn.start_mark.index < prev
                     c = self.build(doc, cn, doc, cn, v, None, None, 0, True, stack)
+                    if alias:
+                        mark_alias(c, doc, prev)
                     c.container = node
                     items.append(c)
-                    last_end = c.end
+                    last_end = prev = c.end
             else:
                 dashes = dash_positions(doc, node)
                 if len(dashes) != len(node.value):
                     raise LoadError(f"{doc.path}: unsupported sequence layout")
                 for d, cn in zip(dashes, node.value):
-                    c = self.build(doc, cn, doc, cn, v, None, d + 1, doc.col(d), False, stack)
+                    alias = cn.start_mark.index < d
+                    a = d + 1 if alias else doc.props_end.get(id(cn), d + 1)
+                    c = self.build(doc, cn, doc, cn, v, None, a, doc.col(d), False, stack)
+                    if alias:
+                        mark_alias(c, doc, a)
+                    c.dash = d
                     c.container = node
                     items.append(c)
                     last_end = c.end
@@ -428,6 +508,56 @@ class Loader:
         over.base = inc if inc.kind == "map" else None
         over.children = merge(inc.children if inc.kind == "map" else {}, children, over)
         return over
+
+
+def mark_alias(v: VNode, doc: Doc, pos: int) -> None:
+    """Record that v is written at pos as an alias: its own text is just the `*name` token."""
+    found = alias_at(doc.text, pos)
+    if found is None:
+        raise LoadError(f"{doc.path}: unsupported alias layout")
+    s, e, v.alias = found
+    v.alias_span = (s, e)
+    v.end = e
+
+
+def alias_twins(root: VNode, segs: list[str]) -> set[str]:
+    """Paths that are the same written value as `segs`, because they reach it through aliases of one anchor.
+
+    Empty if the path itself goes through an alias.
+    """
+    node, i = root, 0
+    while i < len(segs):
+        c = node.child(segs[i])
+        if c is None:
+            break
+        node, i = c, i + 1
+        if node.alias is not None:
+            return set()
+    rest = segs[i:]
+    sigs: dict[int, tuple] = {}
+
+    def walk(n: VNode, p: list[str], chain: tuple) -> None:
+        if n.include is not None:
+            chain = chain + ((n.src_doc.path, id(n.src_node)),)
+        sig = (n.doc.path, id(n.node), n.kind, chain)
+        sigs.setdefault(id(n), sig)
+        if sig == target_sig[0]:
+            out.add(".".join(p + rest))
+        if n.kind == "map":
+            for k, c in n.children.items():
+                walk(c, p + [k], chain)
+        elif n.kind == "seq":
+            for j, c in enumerate(n.children):
+                walk(c, p + [str(j)], chain)
+
+    # first pass finds the target's signature, second collects its twins
+    out: set[str] = set()
+    target_sig: list = [None]
+    walk(root, [], ())
+    target_sig[0] = sigs[id(node)]
+    out.clear()
+    walk(root, [], ())
+    return out
 
 
 def ref_of(node: MappingNode) -> tuple[Node, Node] | None:

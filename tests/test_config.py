@@ -52,8 +52,8 @@ def cfg(theatre):
     return (theatre / ".troupe" / "troupe.yml").read_text()
 
 
-def set_ok(theatre, path, value):
-    r = troupe(theatre, "set", path, value)
+def set_ok(theatre, path, value, *flags):
+    r = troupe(theatre, "set", *flags, path, value)
     assert r.returncode == 0, r.stderr
     assert r.stdout == b""
 
@@ -395,3 +395,43 @@ def test_set_in_include_refuses_to_disturb_other_includers(theatre):
     assert (cfg(theatre), (d / "agents/coder.yaml").read_text()) == before
     set_ok(theatre, "agents.coder.temperature", "0.3")  # as an override it is fine
     assert troupe(theatre, "get", "twin.temperature").returncode == 5
+
+
+ALIASES = "defaults: &d\n  model: opus\ncoder:\n  settings: *d\nreviewer:\n  settings: *d  # shared\n"
+
+
+def test_set_at_anchor_changes_every_alias(theatre):
+    d = theatre / ".troupe"
+    (d / "troupe.yml").write_text(ALIASES + "m: &m opus\nl: &l\n  - a\nuse: [*m, *l]\n")
+    set_ok(theatre, "defaults.model", "sonnet")
+    set_ok(theatre, "m", "haiku")
+    set_ok(theatre, "l.1", "b")
+    set_ok(theatre, "defaults.temp", "1")
+    assert cfg(theatre) == ALIASES.replace("opus", "sonnet\n  temp: 1") + "m: &m haiku\nl: &l\n  - a\n  - b\nuse: [*m, *l]\n"
+    for path, out in [("reviewer.settings.model", b"sonnet\n"), ("coder.settings.temp", b"1\n"), ("use.0", b"haiku\n"), ("use.1.1", b"b\n")]:
+        assert troupe(theatre, "get", path).stdout == out
+    changed = {json.loads(ln)["path"] for ln in troupe(theatre, "history").stdout.splitlines() if json.loads(ln)["op"] == "set"}
+    assert {"coder.settings.model", "reviewer.settings.model", "use.0"} <= changed
+
+
+def test_set_through_alias_is_refused(theatre):
+    (theatre / ".troupe" / "troupe.yml").write_text(ALIASES)
+    for path in ("coder.settings.model", "coder.settings.temp", "coder.settings"):
+        r = troupe(theatre, "set", path, "sonnet")
+        assert r.returncode == 3 and b"--expand-alias" in r.stderr
+    assert cfg(theatre) == ALIASES
+    assert troupe(theatre, "set", "coder.x.<<", "1").returncode == 3
+
+
+def test_set_expand_alias(theatre):
+    (theatre / ".troupe" / "troupe.yml").write_text(ALIASES + "list:\n  - *d\n")
+    set_ok(theatre, "coder.settings.model", "sonnet", "--expand-alias")
+    set_ok(theatre, "reviewer.settings", "x", "--expand-alias")
+    set_ok(theatre, "list.0.model", "haiku", "--expand-alias")
+    assert cfg(theatre) == (
+        "defaults: &d\n  model: opus\n"
+        "coder:\n  settings:  # expanded from *d by troupe\n    model: sonnet\n"
+        "reviewer:\n  settings: x  # expanded from *d by troupe  # shared\n"
+        "list:\n  -  # expanded from *d by troupe\n    model: haiku\n"
+    )
+    assert troupe(theatre, "get", "defaults.model").stdout == b"opus\n"

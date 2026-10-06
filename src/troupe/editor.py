@@ -181,8 +181,15 @@ class Editor:
         self.overlay[doc.path] = text
 
     # operations ----------------------------------------------------------
-    def set(self, segs: list[str], value: Any, in_include: bool = False) -> None:
-        """Set a value; `in_include` puts new keys in the included file rather than an override."""
+    def set(self, segs: list[str], value: Any, in_include: bool = False, expand_alias: bool = False) -> None:
+        """Set a value; `in_include` puts new keys in the included file rather than an override.
+
+        A path reached through an alias is refused unless `expand_alias`, which first replaces the
+        alias by a copy of the anchored value.
+        """
+        path = ".".join(segs)
+        if "<<" in segs:
+            raise WriteRefused(f"{path}: merge keys (<<) are never written")
         node = self.load()
         i = 0
         while i < len(segs):
@@ -191,12 +198,46 @@ class Editor:
                 break
             node = c
             i += 1
+            if node.alias is not None:
+                at = ".".join(segs[:i])
+                if not expand_alias:
+                    raise WriteRefused(
+                        f"{path}: {at} is an alias of &{node.alias}, so this would change every use of it; "
+                        f"set the anchored value, or use --expand-alias to give {at} its own copy"
+                    )
+                if i == len(segs):  # the alias itself: its copy is the new value
+                    self.expand(node, value, at)
+                    return
+                self.expand(node, construct(node.src_node), at)
+                self.set(segs, value, in_include, expand_alias)
+                return
         if i == len(segs):
-            self.assign(segs, node, value, in_include)
+            self.assign(segs, node, value, in_include, expand_alias)
         else:
             self.create(segs, node, i, value, in_include)
 
-    def assign(self, segs: list[str], vn: VNode, value: Any, in_include: bool = False) -> None:
+    def expand(self, vn: VNode, value: Any, path: str) -> None:
+        """Replace the alias `vn` by a block-style `value`, marking the key's line."""
+        if vn.flow_parent:
+            raise WriteRefused(f"{path}: cannot expand an alias inside a flow collection")
+        doc = vn.src_doc
+        text = doc.text
+        nl = doc.newline
+        r = layout(doc)
+        s, e = vn.alias_span
+        head, lines = r.value_after_indicator(value, vn.anchor_indent, style_of(vn.src_node), False)
+        if isinstance(value, (dict, list)) and value and vn.key_node is None:  # list item: content below the dash
+            lines = r.block(value, vn.anchor_indent + 2)
+        rest = text[e : doc.eol(e)].strip()
+        line = (" " + head if head else "") + f"  # expanded from *{vn.alias} by troupe" + ("  " + rest if rest else "")
+        edits: list[Edit] = [(vn.anchor, doc.eol(e), line, False)]
+        if lines:
+            pos = doc.next_line(e)
+            pre = nl if pos == len(text) and not text.endswith("\n") else ""
+            edits.append((pos, pos, pre + _join(lines, nl), False))
+        self.apply(doc, edits)
+
+    def assign(self, segs: list[str], vn: VNode, value: Any, in_include: bool = False, expand_alias: bool = False) -> None:
         path = ".".join(segs)
         if vn.include == "text":
             if not isinstance(value, str):
@@ -215,7 +256,7 @@ class Editor:
         if vn.kind == "map" and isinstance(value, dict) and value and vn.children:
             old_keys = list(vn.children)
             for k, v in value.items():
-                self.set(segs + [k], v, in_include)
+                self.set(segs + [k], v, in_include, expand_alias)
             for k in old_keys:
                 if k not in value:
                     self.remove(segs + [k])
@@ -223,7 +264,7 @@ class Editor:
         if vn.kind == "seq" and isinstance(value, list) and value and vn.children:
             n = len(vn.children)
             for i, v in enumerate(value):
-                self.set(segs + [str(i)], v, in_include)
+                self.set(segs + [str(i)], v, in_include, expand_alias)
             for i in reversed(range(len(value), n)):
                 self.remove(segs + [str(i)])
             return

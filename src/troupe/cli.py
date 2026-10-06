@@ -14,7 +14,7 @@ from .editor import Editor
 from .errors import LoadError, PathError, TroupeError, UsageError, WriteRefused
 from .render import Shower
 from .lineage import lineage, parse_actor
-from .yamldoc import VNode, compose, construct, leaves, values_equal
+from .yamldoc import VNode, alias_twins, compose, construct, leaves, values_equal
 
 
 class _Parser(argparse.ArgumentParser):
@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("value")
     st.add_argument("--reason", help="why the change is made (recorded in history)")
     st.add_argument("--in-include", action="store_true", help="write a new key into the included file, not as an override")
+    st.add_argument("--expand-alias", action="store_true", help="replace an alias on the path by its own copy of the anchored value")
     hist = csub.add_parser("history", parents=[theatre], help="list changes")
     hist.add_argument("path", nargs="?")
     csub.add_parser("watch", parents=[theatre], help="follow edits to the configuration files")
@@ -160,7 +161,8 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor
 
     # set
     old = leaves(root)
-    editor.set(path_segs, value, args.in_include)
+    twins = alias_twins(root, path_segs)  # set at an anchor: every alias of it changes too
+    editor.set(path_segs, value, args.in_include, args.expand_alias)
     new_root = editor.load()
     try:
         target = lookup(new_root, path_segs)
@@ -173,9 +175,9 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor
     if not values_equal(result, value):
         raise WriteRefused(f"{args.path}: value cannot be written back faithfully")
     new = leaves(new_root)
-    prefix = args.path + "."
+    targets = twins | {args.path}
     for p in set(old) | set(new):
-        if p == args.path or p.startswith(prefix):
+        if any(p == t or p.startswith(t + ".") for t in targets):
             continue
         if p not in old or p not in new or not values_equal(old[p], new[p]):
             raise WriteRefused(f"{args.path}: write-back would disturb {p}")
