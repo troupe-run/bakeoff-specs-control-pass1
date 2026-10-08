@@ -15,6 +15,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import urljoin, urlparse
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
@@ -60,16 +61,49 @@ def resolve_plain(s: str) -> Any:
     return s
 
 
-def construct(node: Node | None) -> Any:
+LITERAL_TAG = "!literal"
+
+
+class Literal(str):
+    """A string written tagged `!literal`: taken as it is, never as an include."""
+
+
+def is_literal_tagged(node: Node | None) -> bool:
+    return isinstance(node, ScalarNode) and node.tag == LITERAL_TAG
+
+
+def construct(node: Node | None, tags: bool = False) -> Any:
+    """The value of a node; with `tags`, `!literal` strings come back as `Literal`."""
     if node is None:
         return None
     if isinstance(node, ScalarNode):
+        if is_literal_tagged(node):
+            return Literal(node.value) if tags else node.value
         return resolve_plain(node.value) if node.style is None else node.value
     if isinstance(node, MappingNode):
-        return {key_text(k): construct(v) for k, v in node.value}
+        return {key_text(k): construct(v, tags) for k, v in node.value}
     if isinstance(node, SequenceNode):
-        return [construct(v) for v in node.value]
+        return [construct(v, tags) for v in node.value]
     raise TypeError(node)
+
+
+def is_remote(path: str) -> bool:
+    return path.startswith(("https://", "http://"))
+
+
+def include_spec(value: Any) -> str | None:
+    """What a string read as an include points at (`file:` path or URL), else None."""
+    if isinstance(value, str):
+        if value.startswith("file:"):
+            return value[5:]
+        if is_remote(value):
+            return value
+    return None
+
+
+def is_yaml_target(target: str) -> bool:
+    path = urlparse(target).path if is_remote(target) else target
+    return path.endswith((".yml", ".yaml"))
 
 
 def key_text(node: Node) -> str:
@@ -86,7 +120,7 @@ def compose(text: str, name: str = "<value>") -> Node | None:
 
 
 def values_equal(a: Any, b: Any) -> bool:
-    if type(a) is not type(b):
+    if (str if isinstance(a, str) else type(a)) is not (str if isinstance(b, str) else type(b)):
         return False
     if isinstance(a, dict):
         return a.keys() == b.keys() and all(values_equal(a[k], b[k]) for k in a)
@@ -254,6 +288,8 @@ class VNode:
     dash: int | None = None  # for block list items: offset of the '-'
     alias: str | None = None  # name of the anchor, if this value is written as an alias `*name`
     alias_span: tuple[int, int] | None = None  # the `*name` token in src_doc
+    path: tuple[str, ...] = ()  # path of this value in the configuration
+    tagged: bool = False  # written tagged `!literal`
 
     def py(self) -> Any:
         if self.kind == "map":
@@ -339,9 +375,12 @@ Reader = Callable[[str], str]
 
 
 class Loader:
-    def __init__(self, read: Reader):
+    def __init__(self, read: Reader, literal: Callable[[tuple[str, ...]], bool] | None = None):
         self.read = read
+        self.literal = literal or (lambda path: False)  # the schema says the string at path is a URI
         self.docs: dict[str, Doc] = {}
+        # remote document -> (local file, include string as written there) through which it is included
+        self.remote_refs: dict[str, tuple[str, str]] = {}
 
     def doc(self, path: str) -> Doc:
         if path not in self.docs:
@@ -369,17 +408,20 @@ class Loader:
         flow_parent: bool,
         stack: tuple[str, ...],
         src_end: int | None = None,
+        path: tuple[str, ...] = (),
     ) -> VNode:
         def end_in_src() -> int:
             return src_end if src_end is not None else content_end(src_doc, src_node, anchor, None)
 
         v = VNode("scalar", doc, node, src_doc, src_node, parent, key_node, anchor, anchor_indent, flow_parent)
+        v.path = path
         if isinstance(node, ScalarNode):
             value = construct(node)
-            if isinstance(value, str) and value.startswith("file:"):
-                return self.include(v, value[5:], stack, end_in_src())
+            v.tagged = is_literal_tagged(node)
+            if not v.tagged and include_spec(value) is not None and not self.literal(path):
+                return self.include(v, value, stack, end_in_src())
             v.value = value
-        elif isinstance(node, MappingNode) and ref_of(node) is not None:
+        elif isinstance(node, MappingNode) and self.ref_of(node, path) is not None:
             return self.ref_include(v, node, stack, src_end)
         elif isinstance(node, MappingNode):
             v.kind = "map"
@@ -390,7 +432,10 @@ class Loader:
                 alias = cn.start_mark.index < k.end_mark.index  # an alias points back at its anchor
                 if not alias:
                     a = doc.props_end.get(id(cn), a)
-                c = self.build(doc, cn, doc, cn, v, k, a, doc.col(k.start_mark.index), bool(node.flow_style), stack)
+                c = self.build(
+                    doc, cn, doc, cn, v, k, a, doc.col(k.start_mark.index), bool(node.flow_style), stack,
+                    path=path + (key_text(k),),
+                )
                 if alias:
                     mark_alias(c, doc, a)
                 c.container = node
@@ -409,7 +454,7 @@ class Loader:
                 prev = node.start_mark.index + 1
                 for cn in node.value:
                     alias = cn.start_mark.index < prev
-                    c = self.build(doc, cn, doc, cn, v, None, None, 0, True, stack)
+                    c = self.build(doc, cn, doc, cn, v, None, None, 0, True, stack, path=path + (str(len(items)),))
                     if alias:
                         mark_alias(c, doc, prev)
                     c.container = node
@@ -422,7 +467,7 @@ class Loader:
                 for d, cn in zip(dashes, node.value):
                     alias = cn.start_mark.index < d
                     a = d + 1 if alias else doc.props_end.get(id(cn), d + 1)
-                    c = self.build(doc, cn, doc, cn, v, None, a, doc.col(d), False, stack)
+                    c = self.build(doc, cn, doc, cn, v, None, a, doc.col(d), False, stack, path=path + (str(len(items)),))
                     if alias:
                         mark_alias(c, doc, a)
                     c.dash = d
@@ -437,14 +482,25 @@ class Loader:
         v.end = end_in_src()
         return v
 
-    def include(self, v: VNode, rel: str, stack: tuple[str, ...], src_end: int, overrides: bool = False) -> VNode:
-        base = os.path.dirname(v.doc.path)
-        target = os.path.normpath(os.path.join(base, rel))
-        real = os.path.realpath(target)
+    def include(self, v: VNode, ref: str, stack: tuple[str, ...], src_end: int, overrides: bool = False) -> VNode:
+        """Follow the include string `ref` (`file:…` or a URL) written in v's document."""
+        spec = include_spec(ref)
+        if is_remote(spec):
+            target = spec
+        elif is_remote(v.doc.path):  # a relative include inside a remote document is remote too
+            target = urljoin(v.doc.path, spec)
+        else:
+            target = os.path.normpath(os.path.join(os.path.dirname(v.doc.path), spec))
+        real = target if is_remote(target) else os.path.realpath(target)
         if real in stack:
             raise LoadError(f"{target}: include cycle (from {v.doc.path})")
+        if is_remote(target):
+            via = self.remote_refs.get(v.doc.path) if is_remote(v.doc.path) else (v.doc.path, ref)
+            if via is not None:
+                self.remote_refs.setdefault(target, via)
+        yaml = is_yaml_target(target)
         try:
-            if target.endswith((".yml", ".yaml")):
+            if yaml:
                 tdoc = self.doc(target)
             else:
                 text = self.read(target)
@@ -452,7 +508,7 @@ class Loader:
             raise LoadError(f"{target}: included file not found (from {v.doc.path})") from None
         except UnicodeDecodeError:
             raise LoadError(f"{target}: included file is not UTF-8 (from {v.doc.path})") from None
-        if not target.endswith((".yml", ".yaml")):
+        if not yaml:
             if overrides:
                 raise LoadError(f"{v.doc.path}: overrides on {target}, which is not a YAML include")
             v.include = "text"
@@ -469,7 +525,7 @@ class Loader:
             return v
         inner = self.build(
             tdoc, tdoc.root, v.src_doc, v.src_node, v.parent, v.key_node, v.anchor, v.anchor_indent,
-            v.flow_parent, stack + (real,), src_end,
+            v.flow_parent, stack + (real,), src_end, v.path,
         )
         if inner.include is None:  # else the included file is itself an include: the nearer one counts
             inner.include = "yaml"
@@ -477,12 +533,23 @@ class Loader:
             inner.include_doc = tdoc
         return inner
 
+    def ref_of(self, node: MappingNode, path: tuple[str, ...]) -> tuple[Node, Node] | None:
+        """The `$ref: <include>` entry making a mapping an include, if any."""
+        for k, cn in node.value:
+            if isinstance(k, ScalarNode) and k.value == "$ref" and isinstance(cn, ScalarNode):
+                if is_literal_tagged(cn) or self.literal(path + ("$ref",)):
+                    continue
+                if include_spec(construct(cn)) is not None:
+                    return k, cn
+        return None
+
     def ref_include(self, v: VNode, node: MappingNode, stack: tuple[str, ...], src_end: int | None) -> VNode:
         """A mapping-form include: `$ref: file:…` plus overrides deep-merged into the included content."""
         doc = v.doc
-        ref_k, ref_v = ref_of(node)
+        ref_k, ref_v = self.ref_of(node, v.path)
         a = find_colon(doc, ref_k.end_mark.index)
         over = VNode("map", doc, node, v.src_doc, v.src_node, v.parent, v.key_node, v.anchor, v.anchor_indent, v.flow_parent)
+        over.path = v.path
         ref = VNode("scalar", doc, ref_v, doc, ref_v, over, ref_k, a, doc.col(ref_k.start_mark.index), bool(node.flow_style))
         ref.value = construct(ref_v)
         ref.end = content_end(doc, ref_v, a, None)
@@ -493,14 +560,17 @@ class Loader:
             if k is ref_k:
                 continue
             ka = find_colon(doc, k.end_mark.index)
-            c = self.build(doc, cn, doc, cn, over, k, ka, doc.col(k.start_mark.index), bool(node.flow_style), stack)
+            c = self.build(
+                doc, cn, doc, cn, over, k, ka, doc.col(k.start_mark.index), bool(node.flow_style), stack,
+                path=v.path + (key_text(k),),
+            )
             c.container = node
             children[key_text(k)] = c
             last_end = max(last_end, c.end)
         if src_end is None:
             src_end = content_end(doc, node, v.anchor, last_end) if doc is v.src_doc else content_end(v.src_doc, v.src_node, v.anchor, None)
         over.end = src_end
-        inc = self.include(v, ref.value[5:], stack, src_end, overrides=bool(children))
+        inc = self.include(v, ref.value, stack, src_end, overrides=bool(children))
         if inc.include == "text" or (not children and inc.kind != "map"):
             return inc
         over.include, over.include_path, over.include_doc = "yaml", inc.include_path, inc.include_doc
@@ -558,16 +628,6 @@ def alias_twins(root: VNode, segs: list[str]) -> set[str]:
     out.clear()
     walk(root, [], ())
     return out
-
-
-def ref_of(node: MappingNode) -> tuple[Node, Node] | None:
-    """The `$ref: file:…` entry making a mapping an include, if any."""
-    for k, cn in node.value:
-        if isinstance(k, ScalarNode) and k.value == "$ref" and isinstance(cn, ScalarNode):
-            value = construct(cn)
-            if isinstance(value, str) and value.startswith("file:"):
-                return k, cn
-    return None
 
 
 def merge(base: dict[str, VNode], over: dict[str, VNode], parent: VNode) -> dict[str, VNode]:

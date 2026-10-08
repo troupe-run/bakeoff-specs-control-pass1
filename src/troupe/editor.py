@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import difflib
+import os
 import re
+import urllib.error
+import urllib.request
 from typing import Any
 
 from ruamel.yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
-from .errors import PathError, WriteRefused
+from .errors import LoadError, PathError, WriteRefused
 from .render import (
     Renderer,
     chomp_for,
@@ -18,9 +21,14 @@ from .render import (
     scalar,
     style_of,
 )
+from .schema import SCHEMA_NAME, Schema
 from .yamldoc import (
     Doc,
     construct,
+    include_spec,
+    is_literal_tagged,
+    is_remote,
+    Literal,
     Loader,
     VNode,
     indent_of,
@@ -98,6 +106,23 @@ def header_end(text: str, s: int) -> int:
     return i
 
 
+def tag_end(text: str, s: int) -> int:
+    """Offset just after a `!tag ` written at s (s itself if there is none)."""
+    m = re.compile(r"![^\s,\[\]{}]*[ \t]+").match(text, s)
+    return m.end() if m else s
+
+
+FETCH_TIMEOUT = 30  # seconds
+
+
+def fetch(url: str) -> bytes:
+    try:
+        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT) as r:
+            return r.read()
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise LoadError(f"{url}: cannot fetch remote include: {getattr(e, 'reason', e)}") from None
+
+
 def wrap(text: str, width: int) -> list[str]:
     words = text.split(" ")
     lines = [words[0]]
@@ -155,11 +180,19 @@ class Editor:
         self.overlay: dict[str, str] = {}
         self.disk: dict[str, str] = {}
         self.seen: dict[str, bytes | None] = {}  # raw bytes of every file read (None: unreadable)
+        self.remote_refs: dict[str, tuple[str, str]] = {}  # remote document -> (local file, include string)
+        self.schema_path = os.path.join(os.path.dirname(config_path), SCHEMA_NAME)
+        self.schema: Schema | None = None
+        self.path = ""  # the path being set, for messages
 
     # files -------------------------------------------------------------
     def read(self, path: str) -> str:
         if path in self.overlay:
             return self.overlay[path]
+        if is_remote(path):  # fetched once per command; never watched
+            if path not in self.disk:
+                self.disk[path] = fetch(path).decode("utf-8")
+            return self.disk[path]
         if path not in self.disk:
             self.seen[path] = None
             with open(path, "rb") as f:
@@ -168,13 +201,59 @@ class Editor:
             self.disk[path] = raw.decode("utf-8")
         return self.disk[path]
 
+    def load_schema(self) -> Schema | None:
+        if self.schema is None and os.path.isfile(self.schema_path):
+            try:
+                self.schema = Schema(self.schema_path, self.read(self.schema_path))
+            except UnicodeDecodeError:
+                raise LoadError(f"{self.schema_path}: not UTF-8") from None
+        elif self.schema is None:
+            self.seen.setdefault(self.schema_path, None)  # so that watch notices one being added
+        return self.schema
+
     def load(self) -> VNode:
-        return Loader(self.read).load(self.config_path)
+        schema = self.load_schema()
+        loader = Loader(self.read, schema.is_uri if schema is not None else None)
+        root = loader.load(self.config_path)
+        for url, via in loader.remote_refs.items():
+            self.remote_refs.setdefault(url, via)
+        return root
+
+    def validate(self, root: VNode) -> None:
+        """Raise LoadError if the configuration does not match the schema."""
+        schema = self.load_schema()
+        if schema is not None:
+            schema.validate(root.py())
+
+    def is_uri(self, segs: list[str]) -> bool:
+        schema = self.load_schema()
+        return schema is not None and schema.is_uri(segs)
+
+    def literals(self, segs: list[str], value: Any) -> Any:
+        """`value` with every string that would be read as an include made a `!literal`, unless a URI there."""
+        if isinstance(value, dict):
+            return {k: self.literals(segs + [k], v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.literals(segs + [str(i)], v) for i, v in enumerate(value)]
+        if include_spec(value) is not None and not isinstance(value, Literal) and not self.is_uri(segs):
+            return Literal(value)
+        return value
+
+    def writable(self, path: str) -> None:
+        """Refuse to change a remote document, naming the include line to change instead."""
+        if is_remote(path):
+            local, ref = self.remote_refs.get(path, (None, path))
+            where = f" in {local}" if local else ""
+            raise WriteRefused(
+                f"{self.path}: value comes from remote include {ref}, which troupe cannot change; "
+                f"change the include line {ref}{where} instead"
+            )
 
     def changed(self) -> dict[str, str]:
         return {p: t for p, t in self.overlay.items() if self.disk.get(p) != t}
 
     def apply(self, doc: Doc, edits: list[Edit]) -> None:
+        self.writable(doc.path)
         text = doc.text
         for s, e, new, fix in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
             text = splice(text, s, e, new, fix)
@@ -187,7 +266,7 @@ class Editor:
         A path reached through an alias is refused unless `expand_alias`, which first replaces the
         alias by a copy of the anchored value.
         """
-        path = ".".join(segs)
+        path = self.path = self.path or ".".join(segs)
         if "<<" in segs:
             raise WriteRefused(f"{path}: merge keys (<<) are never written")
         node = self.load()
@@ -208,7 +287,7 @@ class Editor:
                 if i == len(segs):  # the alias itself: its copy is the new value
                     self.expand(node, value, at)
                     return
-                self.expand(node, construct(node.src_node), at)
+                self.expand(node, construct(node.src_node, tags=True), at)
                 self.set(segs, value, in_include, expand_alias)
                 return
         if i == len(segs):
@@ -244,6 +323,7 @@ class Editor:
                 raise WriteRefused(f"{path}: text include {vn.include_path} can only be set to a string")
             if value == vn.value:
                 return
+            self.writable(vn.include_path)
             new = value
             if "\r\n" in vn.value:
                 new = re.sub(r"(?<!\r)\n", "\r\n", value)
@@ -252,6 +332,7 @@ class Editor:
         if values_equal(vn.py(), value):
             return
         if vn.include == "yaml":
+            self.writable(vn.include_path)
             raise WriteRefused(f"{path}: value comes from include {vn.include_path}")
         if vn.kind == "map" and isinstance(value, dict) and value and vn.children:
             old_keys = list(vn.children)
@@ -300,10 +381,12 @@ class Editor:
     def insert_key(self, parent: VNode, key: str, value: Any) -> None:
         """Add a new key; under included content it becomes an override in the including file."""
         include, rel, a = parent, [], parent
-        while include is not None and not (include.include == "yaml" and include.include_doc is not None):
+        while include is not None and not (
+            include.include == "yaml" and include.include_doc is not None and not is_remote(include.src_doc.path)
+        ):  # overrides of remote content go in the local file holding the include line
             include = include.parent
         if include is not None:
-            while a is not include and a.doc is include.include_doc:  # climb to the nearest override
+            while a is not include and (a.doc is include.include_doc or is_remote(a.doc.path)):  # climb to the nearest override
                 p = a.parent
                 if p.kind != "map":  # overrides cannot address list items
                     break
@@ -448,7 +531,7 @@ class Editor:
             else:
                 self.apply(doc, [(value_start(vn), vn.end, r.flow(value, style_of(node)), True)])
             return
-        if is_block_scalar(node) and isinstance(value, str):
+        if is_block_scalar(node) and isinstance(value, str) and not is_literal_tagged(node) and not isinstance(value, Literal):
             self.replace_block_scalar(vn, value, r)
             return
         assert a is not None
@@ -469,7 +552,7 @@ class Editor:
                 region = (doc.line_start(s), doc.next_line(vn.end))
         elif is_block_scalar(node):
             s = node.start_mark.index
-            inline_old = (s, header_end(text, s))
+            inline_old = (s, header_end(text, tag_end(text, s)))
             if vn.end > doc.eol(s):
                 region = (doc.next_line(s), doc.next_line(vn.end))
         else:  # block collection

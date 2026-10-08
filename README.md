@@ -5,7 +5,7 @@ AI orchestration tool. Step 1: the configuration subsystem.
 ```
 uv run troupe config get PATH [--theatre DIR]
 uv run troupe config show [PATH] [--sources] [--theatre DIR]
-uv run troupe config set PATH VALUE [--reason TEXT] [--in-include] [--expand-alias] [--theatre DIR]
+uv run troupe config set PATH VALUE [--reason TEXT] [--in-include] [--expand-alias] [--include] [--theatre DIR]
 uv run troupe config history [PATH] [--theatre DIR]
 uv run troupe config watch [--theatre DIR]
 ```
@@ -21,6 +21,15 @@ turned into mapping form); appended list items and new keys inside list items st
 `set --in-include` puts a new key into the included file itself instead (refused, exit 3, if that would change
 settings elsewhere that include the same file). Choices made where the contract is silent are in `DECISIONS.md`.
 Overrides on a non-YAML include are a load error (exit 4).
+
+Strings starting `https://` or `http://` are remote includes, fetched on every command (YAML if the URL path ends
+`.yml`/`.yaml`, else text; a failed fetch exits 4). They are read-only: changing a value from one exits 3 and names
+the include string written in the local file to change instead; new keys under one become local overrides.
+
+`.troupe/troupe.schema.json` (JSON Schema 2020-12), if present, must validate the loaded configuration (else exit 4;
+a `set` that would break it exits 3). A string whose schema has `"format": "uri"`, or that is tagged `!literal`, is
+taken literally rather than as an include. `set` writes a value that would read as an include tagged `!literal`
+(unless the schema says `format: uri` there), or as an include with `--include`.
 
 YAML anchors are shared values: setting a path defined at an anchor (`&name`) writes it there (the anchor is kept), so
 it changes everywhere the anchor is aliased. Setting a path reached through an alias (`*name`) is refused (exit 3);
@@ -43,6 +52,6 @@ unknown actor. Events recorded before lineage existed report an unknown actor, t
 
 Layout: `yamldoc.py` (position-aware parse + include view), `render.py` (scalar/collection rendering, `show` output),
 `editor.py` (write-back), `store.py` (event-sourced projection), `lineage.py` (actor, timestamp, change id),
-`sync.py` (lock, reconcile, watch), `cli.py`.
+`sync.py` (lock, reconcile, watch), `schema.py` (JSON Schema lookup and validation), `cli.py`.
 
 Tests: `uv run pytest`.

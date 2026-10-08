@@ -435,3 +435,114 @@ def test_set_expand_alias(theatre):
         "list:\n  -  # expanded from *d by troupe\n    model: haiku\n"
     )
     assert troupe(theatre, "get", "defaults.model").stdout == b"opus\n"
+
+
+@pytest.fixture
+def server():
+    import http.server
+    import threading
+    files: dict[str, bytes] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = files.get(self.path)
+            self.send_response(200 if body is not None else 404)
+            self.end_headers()
+            self.wfile.write(body or b"")
+
+        def log_message(self, *a):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    httpd.files = files
+    httpd.url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    yield httpd
+    httpd.shutdown()
+
+
+def test_remote_includes(theatre, server):
+    server.files["/team/base.yaml"] = b"model: opus\nlimits: {tokens: 5}\nrules: file:rules.md\n"
+    server.files["/team/rules.md"] = b"Be kind.\n"
+    server.files["/note.txt"] = b"hello\n"
+    url = server.url
+    (theatre / ".troupe/troupe.yml").write_text(
+        f"team: {url}/team/base.yaml  # shared\nnote: {url}/note.txt\nlocal: file:agents/coder.yaml\n"
+    )
+    assert troupe(theatre, "get", "team.model").stdout == b"opus\n"
+    assert troupe(theatre, "get", "team.rules").stdout == b"Be kind.\n"
+    assert troupe(theatre, "get", "note").stdout == b"hello\n"
+    lines = troupe(theatre, "show", "--sources").stdout.decode().splitlines()
+    assert f"  model: opus # from {url}/team/base.yaml" in lines
+    before = cfg(theatre)
+    for path, value in [("team.model", "x"), ("team.limits.tokens", "6"), ("team.rules", "y"), ("note", "z"), ("team", "q")]:
+        r = troupe(theatre, "set", path, value)
+        assert r.returncode == 3, (path, r.stderr)
+        want = f"{url}/note.txt" if path == "note" else f"{url}/team/base.yaml"
+        assert want.encode() in r.stderr
+    assert troupe(theatre, "set", "--in-include", "team.new", "1").returncode == 3
+    assert cfg(theatre) == before
+    # new keys become local overrides
+    set_ok(theatre, "team.limits.time", "9")
+    assert cfg(theatre).startswith(f"team:  # shared\n  $ref: {url}/team/base.yaml\n  limits:\n    time: 9\nnote:")
+    assert troupe(theatre, "get", "team.limits.tokens").stdout == b"5\n"
+    # a failed fetch is a load error
+    del server.files["/note.txt"]
+    assert troupe(theatre, "get", "team.model").returncode == 4
+
+
+def test_unreachable_remote_include(theatre):
+    (theatre / ".troupe/troupe.yml").write_text("x: https://127.0.0.1:1/a.yaml\n")
+    r = troupe(theatre, "show")
+    assert r.returncode == 4 and b"127.0.0.1:1" in r.stderr
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "homepage": {"type": "string", "format": "uri"},
+        "links": {"type": "array", "items": {"type": "string", "format": "uri"}},
+        "hooks": {"type": "object", "additionalProperties": {"$ref": "#/$defs/uri"}},
+        "count": {"type": "integer", "minimum": 0},
+    },
+    "$defs": {"uri": {"type": "string", "format": "uri"}},
+}
+
+
+def test_schema_literals_and_validation(theatre):
+    d = theatre / ".troupe"
+    (d / "troupe.schema.json").write_text(json.dumps(SCHEMA))
+    (d / "troupe.yml").write_text(
+        "homepage: https://example.invalid/x.yaml\nlinks: [file:a.yaml]\nhooks: {a: http://example.invalid/h}\n"
+        "raw: !literal file:nope.yaml\ncount: 1\n"
+    )
+    assert troupe(theatre, "get", "homepage").stdout == b"https://example.invalid/x.yaml\n"
+    assert troupe(theatre, "get", "links.0").stdout == b"file:a.yaml\n"
+    assert troupe(theatre, "get", "hooks.a").stdout == b"http://example.invalid/h\n"
+    assert troupe(theatre, "get", "raw").stdout == b"file:nope.yaml\n"
+    assert "raw: !literal file:nope.yaml" in troupe(theatre, "show").stdout.decode()
+    # a set that would break the schema is refused
+    before = cfg(theatre)
+    assert troupe(theatre, "set", "count", "-1").returncode == 3
+    assert troupe(theatre, "set", "homepage", "5").returncode == 3
+    assert cfg(theatre) == before
+    # include-looking strings are written as literals unless the schema says URI, or --include
+    set_ok(theatre, "homepage", "https://example.invalid/y")
+    set_ok(theatre, "other", "file:agents/coder.yaml")
+    set_ok(theatre, "raw", "https://example.invalid/z")
+    set_ok(theatre, "more", "[file:x.yaml, 1]")
+    set_ok(theatre, "inc", "file:agents/coder.yaml", "--include")
+    text = cfg(theatre)
+    assert "homepage: https://example.invalid/y\n" in text
+    assert "other: !literal file:agents/coder.yaml\n" in text
+    assert "raw: !literal https://example.invalid/z\n" in text
+    assert "more:\n  - !literal file:x.yaml\n  - 1\n" in text
+    assert "inc: file:agents/coder.yaml\n" in text
+    assert troupe(theatre, "get", "other").stdout == b"file:agents/coder.yaml\n"
+    assert troupe(theatre, "get", "inc.model").stdout == b"sonnet\n"
+    set_ok(theatre, "raw", "plain")
+    assert "raw: plain\n" in cfg(theatre)
+    # an invalid configuration does not load
+    (d / "troupe.yml").write_text(cfg(theatre).replace("count: 1", "count: many"))
+    r = troupe(theatre, "show")
+    assert r.returncode == 4 and b"count" in r.stderr

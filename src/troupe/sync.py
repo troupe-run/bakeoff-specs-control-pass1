@@ -34,6 +34,7 @@ def locked(state_dir: str) -> Iterator[None]:
 def reconcile(app: Troupe, editor: Editor) -> tuple[VNode, Configuration]:
     """Load the files and record a set/remove event for each leaf that differs."""
     root = editor.load()
+    editor.validate(root)
     return root, app.reconcile(leaves(root))
 
 

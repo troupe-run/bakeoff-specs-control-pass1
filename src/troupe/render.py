@@ -9,7 +9,7 @@ from typing import Any, Callable
 from ruamel.yaml.error import YAMLError
 from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
-from .yamldoc import _yaml, resolve_plain
+from .yamldoc import LITERAL_TAG, Literal, _yaml, resolve_plain
 
 PLAIN, SINGLE, DOUBLE = "plain", "'", '"'
 
@@ -112,8 +112,15 @@ def double(s: str) -> str:
     return '"' + "".join(out) + '"'
 
 
+def tagged(value: Any, text: str) -> str:
+    """Prefix `!literal` to the rendering of a `Literal`."""
+    return f"{LITERAL_TAG} {text}" if isinstance(value, Literal) else text
+
+
 def scalar(value: Any, style: str | None, flow: bool) -> str:
     """Render a scalar on one line, preferring `style`, else the minimal one."""
+    if isinstance(value, Literal):
+        return tagged(value, scalar(str(value), style, flow))
     if not isinstance(value, str):
         return render_non_string(value)
     order = [PLAIN, SINGLE, DOUBLE]
@@ -180,7 +187,7 @@ class Renderer:
         if isinstance(value, list):
             return "[" + ", ".join(self.flow(v) for v in value) + "]"
         if is_multiline(value):
-            return double(value)
+            return tagged(value, double(value))
         return scalar(value, style, True)
 
     def value_after_indicator(self, value: Any, indent: int, style: str | None, compact: bool) -> tuple[str, list[str]]:
@@ -198,9 +205,9 @@ class Renderer:
         if isinstance(value, (dict, list)):
             return ("{}" if isinstance(value, dict) else "[]"), []
         if is_multiline(value) and literal_ok(value):
-            return "|" + chomp_for(value), literal_lines(value, indent + self.step)
+            return tagged(value, "|" + chomp_for(value)), literal_lines(value, indent + self.step)
         if is_multiline(value):
-            return double(value), []
+            return tagged(value, double(value)), []
         return scalar(value, style, False), []
 
     def entry(self, key: str, value: Any, indent: int, kstyle: str | None = None, vstyle: str | None = None) -> list[str]:
@@ -252,6 +259,12 @@ class Shower:
         return f" # from {self.source(v)}" if self.source else ""
 
     def scalar_head(self, v: Any, indent: int) -> tuple[str, list[str]]:
+        if v.tagged:
+            head, rest = self.plain_head(v, indent)
+            return f"{LITERAL_TAG} {head}", rest
+        return self.plain_head(v, indent)
+
+    def plain_head(self, v: Any, indent: int) -> tuple[str, list[str]]:
         value = v.value
         if isinstance(value, str) and (v.include == "text" or ("\n" in value and "\r" not in value)):
             lit = _text_literal(value, indent)

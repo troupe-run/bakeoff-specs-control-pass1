@@ -14,7 +14,7 @@ from .editor import Editor
 from .errors import LoadError, PathError, TroupeError, UsageError, WriteRefused
 from .render import Shower
 from .lineage import lineage, parse_actor
-from .yamldoc import VNode, alias_twins, compose, construct, leaves, values_equal
+from .yamldoc import VNode, alias_twins, compose, construct, include_spec, is_remote, leaves, values_equal
 
 
 class _Parser(argparse.ArgumentParser):
@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--reason", help="why the change is made (recorded in history)")
     st.add_argument("--in-include", action="store_true", help="write a new key into the included file, not as an override")
     st.add_argument("--expand-alias", action="store_true", help="replace an alias on the path by its own copy of the anchored value")
+    st.add_argument("--include", action="store_true", help="write a value like file:x or https://… as an include, not a !literal string")
     hist = csub.add_parser("history", parents=[theatre], help="list changes")
     hist.add_argument("path", nargs="?")
     csub.add_parser("watch", parents=[theatre], help="follow edits to the configuration files")
@@ -63,7 +64,7 @@ def parse_value(text: str) -> Any:
         raise UsageError(f"invalid value: {text!r}") from None
     if not isinstance(node, SequenceNode) or len(node.value) != 1:
         raise UsageError(f"invalid value: {text!r}")
-    return construct(node.value[0])
+    return construct(node.value[0], tags=True)
 
 
 def config_file(theatre: str) -> str:
@@ -100,6 +101,8 @@ def lookup(root: VNode, segs: list[str]) -> VNode:
 
 def source_of(v: VNode, theatre: str) -> str:
     path = v.include_path if v.include else v.doc.path
+    if is_remote(path):
+        return path
     return os.path.relpath(path, theatre).replace(os.sep, "/")
 
 
@@ -126,7 +129,11 @@ def run(args: argparse.Namespace) -> int:
         app = Troupe(state_dir)
         if args.action == "history":  # reports what has been recorded; never reconciles
             root = None
-            config = app.configuration() or app.ensure_imported(leaves(editor.load()))
+            config = app.configuration()
+            if config is None:
+                root = editor.load()
+                editor.validate(root)
+                config = app.ensure_imported(leaves(root))
         else:
             root, config = reconcile(app, editor)
         return act(args, path_segs, value, actor, editor, root, app, config)
@@ -162,8 +169,13 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor
     # set
     old = leaves(root)
     twins = alias_twins(root, path_segs)  # set at an anchor: every alias of it changes too
-    editor.set(path_segs, value, args.in_include, args.expand_alias)
+    written = value if args.include else editor.literals(path_segs, value)
+    editor.set(path_segs, written, args.in_include, args.expand_alias)
     new_root = editor.load()
+    try:
+        editor.validate(new_root)
+    except LoadError as e:
+        raise WriteRefused(f"{args.path}: the configuration would not match the schema: {e.message}") from None
     try:
         target = lookup(new_root, path_segs)
         result = target.py()
@@ -171,8 +183,10 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor
             result = result.replace("\r\n", "\n") if "\r\n" not in value else result
             value = value.replace("\r\n", "\n") if "\r\n" not in result else value
     except PathError:
-        result = object()
-    if not values_equal(result, value):
+        target, result = None, object()
+    # with --include, include strings in the value read back as what they include
+    included = args.include and has_include(value) and target is not None
+    if not included and not values_equal(result, value):
         raise WriteRefused(f"{args.path}: value cannot be written back faithfully")
     new = leaves(new_root)
     targets = twins | {args.path}
@@ -186,6 +200,14 @@ def act(args: argparse.Namespace, path_segs: list[str] | None, value: Any, actor
             f.write(text)
     app.record(config, old, new, lineage("cli", actor, args.reason))
     return 0
+
+
+def has_include(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(has_include(v) for v in value.values())
+    if isinstance(value, list):
+        return any(has_include(v) for v in value)
+    return include_spec(value) is not None
 
 
 def main(argv: list[str] | None = None) -> int:

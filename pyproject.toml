@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "eventsourcing>=9.5.5",
+    "jsonschema>=4.23",
     "ruamel-yaml>=0.19.1",
 ]
 
